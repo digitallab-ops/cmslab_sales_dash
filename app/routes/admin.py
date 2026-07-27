@@ -221,9 +221,13 @@ async def upload_items(
     async def _save(uf: Optional[UploadFile], suffix: str) -> Optional[str]:
         if uf is None:
             return None
-        content = await uf.read()
+        # 대용량 파일 메모리 스파이크 방지: 1MB씩 스트리밍 저장
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(content)
+            while True:
+                chunk = await uf.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
             return tmp.name
 
     paths = {

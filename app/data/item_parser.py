@@ -61,44 +61,86 @@ def _load_masters(mod, tmp_dir: str):
 
 # ─── 1) 원본 적재 (스트리밍 → 청크 insert) ────────────────────────────────────
 
+_COPY_COLS = ["snapshot_id", "yr", "date_int", "cust_code", "cust_name",
+              "item_code", "item_name", "qty", "rev", "cost"]
+_COPY_CHUNK = 50_000   # COPY는 대량에 효율적이라 청크를 크게
+
+
 def ingest_raw(db: Session, snapshot_id: int, xlsx_path: str, yr: int,
                task_id: Optional[str] = None) -> int:
-    """통합매출 xlsx를 스트리밍하며 item_raw에 청크 insert. 적재 건수 반환."""
-    import openpyxl
-    from ..models import ItemRaw
+    """통합매출 xlsx를 스트리밍하며 item_raw에 Postgres COPY로 적재. 적재 건수 반환.
+
+    한 줄씩 INSERT 대신 COPY ... FROM STDIN 을 사용해 150만 행도 빠르게 적재한다.
+    (csv 모듈로 안전하게 인용/이스케이프)
+    """
+    import io, csv, openpyxl
+    from ..database import SCHEMA
 
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb.active
-    ins = ItemRaw.__table__.insert()
 
-    buf: List[dict] = []
+    from ..models import ItemRaw
+    ins = ItemRaw.__table__.insert()  # COPY 실패 시 폴백용
+
+    copy_sql = (
+        f'COPY {SCHEMA}.item_raw ({",".join(_COPY_COLS)}) '
+        f"FROM STDIN WITH (FORMAT csv)"
+    )
+
+    sio = io.StringIO()
+    writer = csv.writer(sio, lineterminator="\n")
+    buf_rows = 0
     inserted = 0
+    use_copy = True
 
     def _flush():
-        nonlocal inserted, buf
-        if buf:
-            db.execute(ins, buf)
-            db.commit()
-            inserted += len(buf)
-            buf = []
+        nonlocal buf_rows, inserted, sio, writer, use_copy
+        if buf_rows == 0:
+            return
+        if use_copy:
+            try:
+                sio.seek(0)
+                raw = db.connection().connection   # DBAPI(psycopg2) 커넥션
+                cur = raw.cursor()
+                cur.copy_expert(copy_sql, sio)
+                cur.close()
+                db.commit()
+            except Exception as e:
+                # COPY 미지원/실패 시 executemany 폴백으로 전환
+                db.rollback()
+                use_copy = False
+                if task_id:
+                    _p._set_task(task_id, message=f"COPY 폴백(executemany)로 전환: {e}")
+                _flush_via_insert()
+                return
+        inserted += buf_rows
+        sio = io.StringIO(); writer = csv.writer(sio, lineterminator="\n"); buf_rows = 0
+        if task_id:
+            _p._set_task(task_id, message=f"원본 적재 중 ({yr}년, {inserted:,}건)")
+
+    # 폴백 경로: 현재 sio에 쌓인 CSV를 다시 파싱하지 않기 위해, 폴백 전환 후에는
+    # 아래 루프가 _pending 리스트에 dict를 쌓아 executemany로 넣는다.
+    _pending: List[dict] = []
+
+    def _flush_via_insert():
+        nonlocal inserted, _pending
+        if _pending:
+            db.execute(ins, _pending); db.commit()
+            inserted += len(_pending); _pending = []
             if task_id:
                 _p._set_task(task_id, message=f"원본 적재 중 ({yr}년, {inserted:,}건)")
 
     # pilot load_sales 와 동일한 컬럼 인덱스/필터 (min_row=3)
     for row in ws.iter_rows(min_row=3, values_only=True):
-        date_val = row[1]
-        cust_raw = row[2]
+        date_val = row[1]; cust_raw = row[2]
         cust_nm  = row[3] if len(row) > 3 else None
         sku_raw  = row[4]
         item_nm  = row[5] if len(row) > 5 else None
-        qty  = float(row[6] or 0)
-        rev  = float(row[7] or 0)
-        cost = float(row[8] or 0)
+        qty  = float(row[6] or 0); rev = float(row[7] or 0); cost = float(row[8] or 0)
         if not (date_val and sku_raw and (rev or qty)):
             continue
         try:
-            d = int(float(str(date_val)))
-            month = (d % 10000) // 100
+            d = int(float(str(date_val))); month = (d % 10000) // 100
             if not 1 <= month <= 12:
                 continue
         except (ValueError, TypeError):
@@ -108,23 +150,26 @@ def ingest_raw(db: Session, snapshot_id: int, xlsx_path: str, yr: int,
             cust = str(int(float(str(cust_raw))))
         except (ValueError, TypeError):
             cust = str(cust_raw).strip()
+        cust_name = (str(cust_nm).strip() if cust_nm else "")[:200]
+        item_name = (str(item_nm).strip() if item_nm else "")[:200]
 
-        buf.append({
-            "snapshot_id": snapshot_id,
-            "yr": yr,
-            "date_int": d,
-            "cust_code": cust,
-            "cust_name": (str(cust_nm).strip() if cust_nm else "")[:200],
-            "item_code": sku,
-            "item_name": (str(item_nm).strip() if item_nm else "")[:200],
-            "qty": qty,
-            "rev": rev,
-            "cost": cost,
-        })
-        if len(buf) >= _p._CHUNK_SIZE:
-            _flush()
+        if use_copy:
+            writer.writerow([snapshot_id, yr, d, cust, cust_name, sku, item_name, qty, rev, cost])
+            buf_rows += 1
+            if buf_rows >= _COPY_CHUNK:
+                _flush()
+        else:
+            _pending.append({
+                "snapshot_id": snapshot_id, "yr": yr, "date_int": d,
+                "cust_code": cust, "cust_name": cust_name,
+                "item_code": sku, "item_name": item_name,
+                "qty": qty, "rev": rev, "cost": cost,
+            })
+            if len(_pending) >= _p._CHUNK_SIZE:
+                _flush_via_insert()
 
     _flush()
+    _flush_via_insert()
     wb.close()
     return inserted
 
