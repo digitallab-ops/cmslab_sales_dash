@@ -59,76 +59,60 @@ def _load_masters(mod, tmp_dir: str):
     return factory, cmap, country_map, customer_map, channel_order
 
 
-# ─── 1) 원본 적재 (스트리밍 → 청크 insert) ────────────────────────────────────
+# ─── 전용 DB 커넥션 (풀 recycle/timeout 간섭 없이 장시간 대량 작업용) ──────────
+
+def _pg_connect():
+    """SQLAlchemy 풀과 무관한 전용 psycopg2 커넥션 (대량 적재/집계 전용)."""
+    import psycopg2
+    from ..database import DATABASE_URL
+    return psycopg2.connect(DATABASE_URL)
+
+
+# ─── 1) 원본 적재 (스트리밍 → COPY, 전용 커넥션) ──────────────────────────────
 
 _COPY_COLS = ["snapshot_id", "yr", "date_int", "cust_code", "cust_name",
               "item_code", "item_name", "qty", "rev", "cost"]
-_COPY_CHUNK = 50_000   # COPY는 대량에 효율적이라 청크를 크게
+_COPY_CHUNK = 50_000
+
+_DIMS = ["yr", "month", "quarter", "team", "channel", "country", "customer",
+         "brand", "theme", "dl_cat", "item_group", "item_cat", "sku", "sku_name", "sale_type"]
+_REC_COLS = ["snapshot_id"] + _DIMS + ["qty", "rev", "cost"]
 
 
-def ingest_raw(db: Session, snapshot_id: int, xlsx_path: str, yr: int,
-               task_id: Optional[str] = None) -> int:
-    """통합매출 xlsx를 스트리밍하며 item_raw에 Postgres COPY로 적재. 적재 건수 반환.
-
-    한 줄씩 INSERT 대신 COPY ... FROM STDIN 을 사용해 150만 행도 빠르게 적재한다.
-    (csv 모듈로 안전하게 인용/이스케이프)
-    """
+def ingest_raw(conn, snapshot_id: int, xlsx_path: str, yr: int,
+               base_count: int = 0, task_id: Optional[str] = None) -> int:
+    """통합매출 xlsx를 스트리밍하며 item_raw에 Postgres COPY로 적재 (전용 커넥션).
+    청크마다 커밋 + item_snapshots.raw_count를 갱신해 진행상황을 DB에 남긴다. 적재 건수 반환."""
     import io, csv, openpyxl
     from ..database import SCHEMA
 
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb.active
-
-    from ..models import ItemRaw
-    ins = ItemRaw.__table__.insert()  # COPY 실패 시 폴백용
-
-    copy_sql = (
-        f'COPY {SCHEMA}.item_raw ({",".join(_COPY_COLS)}) '
-        f"FROM STDIN WITH (FORMAT csv)"
-    )
+    copy_sql = f'COPY {SCHEMA}.item_raw ({",".join(_COPY_COLS)}) FROM STDIN WITH (FORMAT csv)'
 
     sio = io.StringIO()
     writer = csv.writer(sio, lineterminator="\n")
     buf_rows = 0
     inserted = 0
-    use_copy = True
 
     def _flush():
-        nonlocal buf_rows, inserted, sio, writer, use_copy
+        nonlocal buf_rows, inserted, sio, writer
         if buf_rows == 0:
             return
-        if use_copy:
-            try:
-                sio.seek(0)
-                raw = db.connection().connection   # DBAPI(psycopg2) 커넥션
-                cur = raw.cursor()
-                cur.copy_expert(copy_sql, sio)
-                cur.close()
-                db.commit()
-            except Exception as e:
-                # COPY 미지원/실패 시 executemany 폴백으로 전환
-                db.rollback()
-                use_copy = False
-                if task_id:
-                    _p._set_task(task_id, message=f"COPY 폴백(executemany)로 전환: {e}")
-                _flush_via_insert()
-                return
+        sio.seek(0)
+        cur = conn.cursor()
+        cur.copy_expert(copy_sql, sio)
         inserted += buf_rows
+        # 진행상황 DB 영속화 (UI 폴링이 끊겨도 어디까지 됐는지 확인 가능)
+        cur.execute(
+            f"UPDATE {SCHEMA}.item_snapshots SET raw_count=%s WHERE id=%s",
+            (base_count + inserted, snapshot_id),
+        )
+        cur.close()
+        conn.commit()
         sio = io.StringIO(); writer = csv.writer(sio, lineterminator="\n"); buf_rows = 0
         if task_id:
-            _p._set_task(task_id, message=f"원본 적재 중 ({yr}년, {inserted:,}건)")
-
-    # 폴백 경로: 현재 sio에 쌓인 CSV를 다시 파싱하지 않기 위해, 폴백 전환 후에는
-    # 아래 루프가 _pending 리스트에 dict를 쌓아 executemany로 넣는다.
-    _pending: List[dict] = []
-
-    def _flush_via_insert():
-        nonlocal inserted, _pending
-        if _pending:
-            db.execute(ins, _pending); db.commit()
-            inserted += len(_pending); _pending = []
-            if task_id:
-                _p._set_task(task_id, message=f"원본 적재 중 ({yr}년, {inserted:,}건)")
+            _p._set_task(task_id, message=f"원본 적재 중 ({yr}년, {base_count + inserted:,}건)")
 
     # pilot load_sales 와 동일한 컬럼 인덱스/필터 (min_row=3)
     for row in ws.iter_rows(min_row=3, values_only=True):
@@ -152,53 +136,35 @@ def ingest_raw(db: Session, snapshot_id: int, xlsx_path: str, yr: int,
             cust = str(cust_raw).strip()
         cust_name = (str(cust_nm).strip() if cust_nm else "")[:200]
         item_name = (str(item_nm).strip() if item_nm else "")[:200]
-
-        if use_copy:
-            writer.writerow([snapshot_id, yr, d, cust, cust_name, sku, item_name, qty, rev, cost])
-            buf_rows += 1
-            if buf_rows >= _COPY_CHUNK:
-                _flush()
-        else:
-            _pending.append({
-                "snapshot_id": snapshot_id, "yr": yr, "date_int": d,
-                "cust_code": cust, "cust_name": cust_name,
-                "item_code": sku, "item_name": item_name,
-                "qty": qty, "rev": rev, "cost": cost,
-            })
-            if len(_pending) >= _p._CHUNK_SIZE:
-                _flush_via_insert()
+        writer.writerow([snapshot_id, yr, d, cust, cust_name, sku, item_name, qty, rev, cost])
+        buf_rows += 1
+        if buf_rows >= _COPY_CHUNK:
+            _flush()
 
     _flush()
-    _flush_via_insert()
     wb.close()
     return inserted
 
 
-# ─── 2) DB 원본 → 15차원 집계 → item_records ──────────────────────────────────
+# ─── 2) DB 원본 → 15차원 집계 (전용 커넥션 + 서버사이드 커서) ──────────────────
 
-_DIMS = ["yr", "month", "quarter", "team", "channel", "country", "customer",
-         "brand", "theme", "dl_cat", "item_group", "item_cat", "sku", "sku_name", "sale_type"]
+class _Row:
+    """psycopg2 튜플을 속성 접근으로 감싸는 경량 래퍼 (_accumulate 재사용용)."""
+    __slots__ = ("yr", "date_int", "cust_code", "item_code", "item_name", "qty", "rev", "cost")
+    def __init__(self, t):
+        (self.yr, self.date_int, self.cust_code, self.item_code,
+         self.item_name, self.qty, self.rev, self.cost) = t
 
 
-def aggregate_from_db(db: Session, snapshot_id: int, mod, masters,
-                      task_id: Optional[str] = None) -> int:
-    """item_raw를 스트리밍으로 읽어 15차원 누적 후 item_records에 청크 insert. 집계 건수 반환."""
-    from ..models import ItemRaw, ItemRecord
+_SELECT_RAW = "SELECT yr,date_int,cust_code,item_code,item_name,qty,rev,cost FROM {schema}.item_raw WHERE snapshot_id=%s"
 
-    factory, cmap, country_map, customer_map, _ = masters
-    acc: Dict[tuple, list] = {}   # key(15차원) -> [qty, rev, cost]
 
-    if task_id:
-        _p._set_task(task_id, message="집계 중 (원본 스트리밍)...")
-
-    # pass 1: 스트리밍 누적 (server-side cursor)
-    q = (
-        db.query(ItemRaw)
-        .filter(ItemRaw.snapshot_id == snapshot_id)
-        .yield_per(10000)
-    )
+def _accumulate(row_iter, mod, masters, task_id=None, progress_label="") -> Dict[tuple, list]:
+    """item_raw 행 iterator(_Row)를 pilot과 동일한 per-row 변환으로 15차원 누적."""
+    factory, cmap, country_map, customer_map = masters[0], masters[1], masters[2], masters[3]
+    acc: Dict[tuple, list] = {}
     seen = 0
-    for r in q:
+    for r in row_iter:
         sku = r.item_code
         cust = r.cust_code
         month = (r.date_int % 10000) // 100
@@ -224,28 +190,140 @@ def aggregate_from_db(db: Session, snapshot_id: int, mod, masters,
             cell[0] += qv; cell[1] += rv; cell[2] += cv
         seen += 1
         if task_id and seen % 200000 == 0:
-            _p._set_task(task_id, message=f"집계 중 ({seen:,}건 처리, {len(acc):,} 그룹)")
+            _p._set_task(task_id, message=f"{progress_label} ({seen:,}건 처리, {len(acc):,} 그룹)")
+    return acc
 
-    # pass 2: 청크 insert
-    ins = ItemRecord.__table__.insert()
-    rows: List[dict] = []
-    agg = 0
+
+def _acc_to_records(acc: Dict[tuple, list], allowed_teams: Optional[List[str]] = None) -> List[Dict]:
+    """누적 dict → make_html용 record dict 리스트 (정수 반올림, 팀 필터)."""
+    team_set = set(allowed_teams) if allowed_teams else None
+    out = []
     for key, (qv, rv, cv) in acc.items():
+        if team_set is not None and key[3] not in team_set:   # key[3] == team
+            continue
         rec = dict(zip(_DIMS, key))
-        rec["snapshot_id"] = snapshot_id
-        rec["qty"] = round(qv)
-        rec["rev"] = round(rv)
-        rec["cost"] = round(cv)
-        rows.append(rec)
-        if len(rows) >= _p._CHUNK_SIZE:
-            db.execute(ins, rows); db.commit()
-            agg += len(rows); rows = []
-            if task_id:
-                _p._set_task(task_id, message=f"집계 저장 중 ({agg:,}건)")
-    if rows:
-        db.execute(ins, rows); db.commit()
-        agg += len(rows)
+        rec["qty"] = round(qv); rec["rev"] = round(rv); rec["cost"] = round(cv)
+        out.append(rec)
+    return out
+
+
+def aggregate_from_db(conn, snapshot_id: int, mod, masters,
+                      task_id: Optional[str] = None) -> int:
+    """item_raw 전체를 서버사이드 커서로 스트리밍 집계 후 item_records에 COPY. 집계 건수 반환."""
+    import io, csv
+    from ..database import SCHEMA
+
+    if task_id:
+        _p._set_task(task_id, message="집계 중 (원본 스트리밍)...")
+
+    rcur = conn.cursor(name="item_agg_stream")   # 서버사이드 커서 → 스트리밍
+    rcur.itersize = 20000
+    rcur.execute(_SELECT_RAW.format(schema=SCHEMA), (snapshot_id,))
+    acc = _accumulate((_Row(t) for t in rcur), mod, masters, task_id, "집계 중")
+    rcur.close()
+
+    # item_records COPY 저장
+    copy_sql = f'COPY {SCHEMA}.item_records ({",".join(_REC_COLS)}) FROM STDIN WITH (FORMAT csv)'
+    sio = io.StringIO(); writer = csv.writer(sio, lineterminator="\n")
+    buf = 0; agg = 0
+    wcur = conn.cursor()
+
+    def _flush():
+        nonlocal sio, writer, buf, agg
+        if buf == 0:
+            return
+        sio.seek(0)
+        wcur.copy_expert(copy_sql, sio)
+        conn.commit()
+        agg += buf
+        sio = io.StringIO(); writer = csv.writer(sio, lineterminator="\n"); buf = 0
+        if task_id:
+            _p._set_task(task_id, message=f"집계 저장 중 ({agg:,}건)")
+
+    for key, (qv, rv, cv) in acc.items():
+        writer.writerow([snapshot_id] + list(key) + [round(qv), round(rv), round(cv)])
+        buf += 1
+        if buf >= _COPY_CHUNK:
+            _flush()
+    _flush()
+    wcur.close()
     return agg
+
+
+def aggregate_range_records(db: Session, snapshot_id: int,
+                            date_from: int, date_to: int,
+                            allowed_teams: Optional[List[str]] = None) -> List[Dict]:
+    """지정 일자 구간만 item_raw에서 즉석 재집계해 records 반환 (저장 안 함)."""
+    from ..database import SCHEMA
+
+    mod = _load_item_mod()
+    masters = _load_masters_from_db(db, snapshot_id)
+    conn = _pg_connect()
+    try:
+        cur = conn.cursor(name="item_range_stream")
+        cur.itersize = 20000
+        cur.execute(
+            _SELECT_RAW.format(schema=SCHEMA) + " AND date_int BETWEEN %s AND %s",
+            (snapshot_id, date_from, date_to),
+        )
+        acc = _accumulate((_Row(t) for t in cur), mod, masters)
+        cur.close()
+    finally:
+        conn.close()
+    return _acc_to_records(acc, allowed_teams)
+
+
+# ─── 마스터 영속화 / 복원 ─────────────────────────────────────────────────────
+
+def _persist_masters(db: Session, snapshot_id: int, masters):
+    """업로드 시 로드한 마스터 dict를 DB에 저장 (날짜범위 재집계 시 재사용)."""
+    from ..models import ItemMasterSku, ItemMasterCustomer
+    factory, cmap, country_map, customer_map, _ = masters
+
+    sku_rows = [{
+        "snapshot_id": snapshot_id, "item_code": code,
+        "sku_name": (v.get("sku_name") or "")[:200], "brand": (v.get("brand") or "")[:20],
+        "dl_cat": (v.get("dl_cat") or "")[:100], "item_cat": (v.get("item_cat") or "")[:100],
+        "item_group": (v.get("item_group") or "")[:100], "sale_type": (v.get("sale_type") or "")[:20],
+        "theme": (v.get("theme") or "")[:100],
+    } for code, v in factory.items()]
+    ins_s = ItemMasterSku.__table__.insert()
+    for i in range(0, len(sku_rows), _p._CHUNK_SIZE):
+        db.execute(ins_s, sku_rows[i:i + _p._CHUNK_SIZE])
+    db.commit()
+
+    codes = set(cmap) | set(country_map) | set(customer_map)
+    cust_rows = [{
+        "snapshot_id": snapshot_id, "cust_code": c,
+        "cust_name": (customer_map.get(c) or "")[:200],
+        "channel": (cmap.get(c) or "")[:100],
+        "country": (country_map.get(c) or "")[:60],
+    } for c in codes]
+    ins_c = ItemMasterCustomer.__table__.insert()
+    for i in range(0, len(cust_rows), _p._CHUNK_SIZE):
+        db.execute(ins_c, cust_rows[i:i + _p._CHUNK_SIZE])
+    db.commit()
+
+
+def _load_masters_from_db(db: Session, snapshot_id: int):
+    """DB에 저장된 마스터를 dict로 복원 → (factory, cmap, country_map, customer_map, [])."""
+    from ..models import ItemMasterSku, ItemMasterCustomer
+    factory = {}
+    for r in db.query(ItemMasterSku).filter(ItemMasterSku.snapshot_id == snapshot_id).yield_per(5000):
+        factory[r.item_code] = {
+            "sku_name": r.sku_name, "brand": r.brand, "dl_cat": r.dl_cat,
+            "item_cat": r.item_cat, "item_group": r.item_group,
+            "sale_type": r.sale_type, "theme": r.theme,
+        }
+    cmap, country_map, customer_map = {}, {}, {}
+    for r in db.query(ItemMasterCustomer).filter(ItemMasterCustomer.snapshot_id == snapshot_id).yield_per(5000):
+        if r.channel:
+            cmap[r.cust_code] = r.channel
+        if r.country:
+            country_map[r.cust_code] = r.country
+        if r.cust_name:
+            customer_map[r.cust_code] = r.cust_name
+    return factory, cmap, country_map, customer_map, []
 
 
 # ─── 3) 오케스트레이션 ────────────────────────────────────────────────────────
@@ -272,34 +350,44 @@ def save_item_upload(db: Session, paths: Dict[str, str], uploaded_by: Optional[i
         channel_order = masters[4]
 
         base_date = datetime.date.today().strftime("%Y년 %m월 %d일")
+        # 완료 전까지 is_active=False → 중간에 죽어도 반쪽 데이터가 화면에 노출되지 않음
         snap = ItemSnapshot(
             base_date=base_date,
             channel_order=json.dumps(channel_order, ensure_ascii=False),
             uploaded_by=uploaded_by,
-            is_active=True,
+            is_active=False,
             uploaded_at=datetime.datetime.utcnow(),
         )
         db.add(snap)
-        db.flush()   # snap.id 확보
+        db.commit()   # 커밋 → snap.id가 전용 커넥션에서도 FK로 보이게
         snap_id = snap.id
 
-        # 원본 적재
+        # 마스터 영속화 (날짜범위 재집계 시 재사용)
         if task_id:
-            _p._set_task(task_id, status="inserting", message="원본 적재 시작...")
-        raw_total = 0
-        for yr, key in ((2025, "sales_2025"), (2026, "sales_2026")):
-            if paths.get(key):
-                raw_total += ingest_raw(db, snap_id, paths[key], yr, task_id)
+            _p._set_task(task_id, message="마스터 저장 중...")
+        _persist_masters(db, snap_id, masters)
 
-        # 집계
-        if task_id:
-            _p._set_task(task_id, status="aggregating", message="집계 시작...")
-        agg_total = aggregate_from_db(db, snap_id, mod, masters, task_id)
+        # 무거운 적재/집계는 전용 psycopg2 커넥션으로 (풀 recycle/timeout 간섭 차단)
+        conn = _pg_connect()
+        try:
+            if task_id:
+                _p._set_task(task_id, status="inserting", message="원본 적재 시작...")
+            raw_total = 0
+            for yr, key in ((2025, "sales_2025"), (2026, "sales_2026")):
+                if paths.get(key):
+                    raw_total += ingest_raw(conn, snap_id, paths[key], yr, raw_total, task_id)
 
+            if task_id:
+                _p._set_task(task_id, status="aggregating", message="집계 시작...")
+            agg_total = aggregate_from_db(conn, snap_id, mod, masters, task_id)
+        finally:
+            conn.close()
+
+        # 완료 처리: 카운트 기록 + 활성화 + 이전 스냅샷 정리 (ORM 세션)
+        snap = db.query(ItemSnapshot).filter(ItemSnapshot.id == snap_id).first()
         snap.raw_count = raw_total
         snap.agg_count = agg_total
-
-        # 이전 스냅샷 inactive + 오래된 것 정리 (active 포함 2개만 유지)
+        snap.is_active = True
         others = (
             db.query(ItemSnapshot)
             .filter(ItemSnapshot.id != snap_id)
@@ -308,7 +396,7 @@ def save_item_upload(db: Session, paths: Dict[str, str], uploaded_by: Optional[i
         )
         for i, o in enumerate(others):
             o.is_active = False
-            if i >= 1:   # 최신(현재) + 직전 1개만 남기고 삭제
+            if i >= 1:   # 현재 + 직전 1개만 남기고 삭제 (원본/마스터 CASCADE 삭제)
                 db.delete(o)
         db.commit()
 
@@ -335,6 +423,18 @@ def get_active_item_snapshot_info(db: Session) -> Optional[dict]:
         "agg_count": s.agg_count,
         "uploaded_at": (s.uploaded_at + _KST).strftime("%Y-%m-%d %H:%M") if s.uploaded_at else "",
     }
+
+
+def get_item_date_bounds(db: Session, snapshot_id: int):
+    """해당 스냅샷 item_raw의 (최소, 최대) date_int. 없으면 None."""
+    from sqlalchemy import func
+    from ..models import ItemRaw
+    row = db.query(func.min(ItemRaw.date_int), func.max(ItemRaw.date_int)).filter(
+        ItemRaw.snapshot_id == snapshot_id
+    ).first()
+    if not row or row[0] is None:
+        return None
+    return (int(row[0]), int(row[1]))
 
 
 def get_active_item_records(db: Session, allowed_teams: Optional[List[str]] = None) -> List[Dict]:
@@ -370,8 +470,9 @@ def make_item_html(records: List[Dict], base_date: str, channel_order: list) -> 
 
 
 def get_cached_item_html(snapshot_id: int, allowed_teams: Optional[List[str]],
-                         records: List[Dict], base_date: str, channel_order: list) -> str:
-    key = (snapshot_id, _p._teams_key(allowed_teams), "items")
+                         records: List[Dict], base_date: str, channel_order: list,
+                         cache_tag: str = "items") -> str:
+    key = (snapshot_id, _p._teams_key(allowed_teams), cache_tag)
     if key in _p._html_cache:
         return _p._html_cache[key]
     html = make_item_html(records, base_date, channel_order)

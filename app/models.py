@@ -165,7 +165,44 @@ class ItemRaw(Base):
     __table_args__ = (
         Index("ix_iraw_snap_item", "snapshot_id", "item_code"),
         Index("ix_iraw_snap_cust", "snapshot_id", "cust_code"),
+        Index("ix_iraw_snap_date", "snapshot_id", "date_int"),
     )
+
+
+class ItemMasterSku(Base):
+    """공장품목조회 마스터 (품목코드 → 분류/브랜드). 날짜범위 재집계용으로 영속화."""
+    __tablename__ = "item_master_sku"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(
+        Integer, ForeignKey("item_snapshots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    item_code = Column(String(30))
+    sku_name = Column(String(200))
+    brand = Column(String(20))
+    dl_cat = Column(String(100))
+    item_cat = Column(String(100))
+    item_group = Column(String(100))
+    sale_type = Column(String(20))
+    theme = Column(String(100))
+
+    __table_args__ = (Index("ix_ims_snap_code", "snapshot_id", "item_code"),)
+
+
+class ItemMasterCustomer(Base):
+    """관리회계 기준정보 마스터 (거래처코드 → 채널/국가/거래처명). 날짜범위 재집계용."""
+    __tablename__ = "item_master_customer"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(
+        Integer, ForeignKey("item_snapshots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cust_code = Column(String(30))
+    cust_name = Column(String(200))
+    channel = Column(String(100))
+    country = Column(String(60))
+
+    __table_args__ = (Index("ix_imc_snap_code", "snapshot_id", "cust_code"),)
 
 
 class ItemRecord(Base):

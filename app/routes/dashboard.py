@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,8 @@ from ..data.item_parser import (
     get_active_item_records,
     get_active_item_snapshot_info,
     get_cached_item_html,
+    aggregate_range_records,
+    get_item_date_bounds,
 )
 
 router = APIRouter()
@@ -151,6 +153,16 @@ _NAV_STYLE = f"""
 #__cms-topnav .nav-links a.nav-page.active{{background:rgba(255,255,255,.2);color:#fff;font-weight:700}}
 #__cms-topnav .nav-left{{display:flex;align-items:center}}
 #__cms-topnav .nav-right{{display:flex;gap:14px;align-items:center}}
+#__cms-topnav .nav-datepick{{display:flex;gap:6px;align-items:center}}
+#__cms-topnav .nav-datepick input[type=date]{{background:rgba(255,255,255,.15);color:#fff;
+  border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 6px;font-size:12px;
+  outline:none;color-scheme:dark}}
+#__cms-topnav .nav-datepick button{{background:rgba(255,255,255,.9);color:#1a56a0;border:none;
+  border-radius:4px;padding:3px 10px;font-size:12px;font-weight:700;cursor:pointer}}
+#__cms-topnav .nav-datepick button:hover{{background:#fff}}
+#__cms-topnav .nav-datepick .dp-reset{{color:rgba(255,255,255,.85);font-size:12px;
+  text-decoration:none;padding:2px 4px}}
+#__cms-topnav .nav-datepick .dp-reset:hover{{color:#fff;text-decoration:underline}}
 #__cms-topnav .nav-user{{color:rgba(255,255,255,.75)}}
 #__cms-topnav a{{color:rgba(255,255,255,.85);text-decoration:none}}
 #__cms-topnav a:hover{{color:#fff}}
@@ -186,7 +198,7 @@ _NAV_SCRIPT = f"""<script>
 </script>"""
 
 
-def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=None, current_snap_id: int = 0, hidden_routes: list = None, current_route: str = "") -> str:
+def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=None, current_snap_id: int = 0, hidden_routes: list = None, current_route: str = "", date_bounds=None, date_from=None, date_to=None) -> str:
     from ..models import AppConfig
 
     app_title = "CMS Lab 매출 대시보드"
@@ -236,6 +248,24 @@ def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=N
         _link_parts.append(f'<a href="{route}" class="{cls}">{label}</a>')
     nav_links = f'<div class="nav-links">{"".join(_link_parts)}</div>' if _link_parts else ""
 
+    # 품목별 매출: 날짜 범위 선택기
+    date_picker = ""
+    if current_route == "/items":
+        def _iso(n):
+            return f"{n//10000}-{(n//100)%100:02d}-{n%100:02d}" if n else ""
+        _min = _iso(date_bounds[0]) if date_bounds else ""
+        _max = _iso(date_bounds[1]) if date_bounds else ""
+        _vf = _iso(date_from) if date_from else _min
+        _vt = _iso(date_to) if date_to else _max
+        _reset = '<a href="/items" class="dp-reset" title="전체 기간">전체</a>' if (date_from or date_to) else ""
+        date_picker = f"""<div class="nav-datepick">
+      <input type="date" id="__dp-from" value="{_vf}" min="{_min}" max="{_max}">
+      <span style="color:rgba(255,255,255,.6)">~</span>
+      <input type="date" id="__dp-to" value="{_vt}" min="{_min}" max="{_max}">
+      <button onclick="(function(){{var f=document.getElementById('__dp-from').value,t=document.getElementById('__dp-to').value;if(!f||!t){{alert('시작일과 종료일을 선택하세요');return;}}location.href='/items?from='+f+'&to='+t;}})()">적용</button>
+      {_reset}
+    </div>"""
+
     nav = f"""{_NAV_STYLE}
 <div id="__cms-topnav">
   <div class="nav-left">
@@ -243,6 +273,7 @@ def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=N
     {nav_links}
   </div>
   <div class="nav-right">
+    {date_picker}
     {week_selector}
     {date_badge}
     <span class="nav-user">{user.name or user.email}</span>
@@ -342,8 +373,19 @@ async def compare(
     )
 
 
+def _parse_date_param(s: str) -> Optional[int]:
+    """'2026-06-15' 또는 '20260615' → 20260615(int). 실패 시 None."""
+    if not s:
+        return None
+    digits = s.replace("-", "").strip()
+    if len(digits) == 8 and digits.isdigit():
+        return int(digits)
+    return None
+
+
 @router.get("/items", response_class=HTMLResponse)
 async def items(
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
@@ -357,15 +399,34 @@ async def items(
     if not info:
         return HTMLResponse(_NO_DATA_HTML)
 
-    records = get_active_item_records(db, current_user.allowed_teams)
-    if not records:
-        return HTMLResponse(_NO_DATA_HTML)
+    # 날짜 범위 파라미터 (?from=YYYY-MM-DD&to=YYYY-MM-DD)
+    d_from = _parse_date_param(request.query_params.get("from", ""))
+    d_to = _parse_date_param(request.query_params.get("to", ""))
+    bounds = get_item_date_bounds(db, info["id"])   # (min, max) or None
 
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
-    html = get_cached_item_html(
-        info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
-    )
+
+    if d_from and d_to and d_from <= d_to:
+        # 지정 구간만 즉석 재집계
+        records = aggregate_range_records(db, info["id"], d_from, d_to, current_user.allowed_teams)
+        if not records:
+            return HTMLResponse(_NO_DATA_HTML)
+        def _fmt(n): return f"{n//10000}-{(n//100)%100:02d}-{n%100:02d}"
+        label = f"{_fmt(d_from)} ~ {_fmt(d_to)}"
+        html = get_cached_item_html(
+            info["id"], current_user.allowed_teams, records, label, info["channel_order"],
+            cache_tag=f"items:{d_from}:{d_to}",
+        )
+    else:
+        records = get_active_item_records(db, current_user.allowed_teams)
+        if not records:
+            return HTMLResponse(_NO_DATA_HTML)
+        html = get_cached_item_html(
+            info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
+        )
+
     return HTMLResponse(
-        _inject_nav(html, current_user, db, base_date=info["base_date"], hidden_routes=hidden, current_route="/items"),
+        _inject_nav(html, current_user, db, base_date=info["base_date"], hidden_routes=hidden,
+                    current_route="/items", date_bounds=bounds, date_from=d_from, date_to=d_to),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
