@@ -6,6 +6,7 @@
 TABS = [
     {"id": "dashboard", "label": "매출 대시보드", "route": "/dashboard"},
     {"id": "compare",   "label": "매출현황(표)",  "route": "/compare"},
+    {"id": "items",     "label": "품목별 매출",   "route": "/items"},
 ]
 
 

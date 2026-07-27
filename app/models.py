@@ -126,3 +126,75 @@ class AppConfig(Base):
 
     key = Column(String(100), primary_key=True)
     value = Column(Text, nullable=True)
+
+
+# ─── 품목별 매출 대시보드 (item dashboard) ───────────────────────────────────
+
+class ItemSnapshot(Base):
+    """품목 데이터 업로드 배치 단위. 원본(ItemRaw)과 집계(ItemRecord)를 묶는다."""
+    __tablename__ = "item_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    base_date = Column(String(50), default="")
+    channel_order = Column(Text, nullable=True)   # JSON 문자열: 채널 노출 순서
+    raw_count = Column(Integer, default=0)
+    agg_count = Column(Integer, default=0)
+    uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+
+class ItemRaw(Base):
+    """통합매출 원본 트랜잭션 (~150만 행). 언제든 SQL 조회용."""
+    __tablename__ = "item_raw"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(
+        Integer, ForeignKey("item_snapshots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    yr = Column(Integer)
+    date_int = Column(Integer)          # YYYYMMDD
+    cust_code = Column(String(30))
+    cust_name = Column(String(200))
+    item_code = Column(String(30))
+    item_name = Column(String(200))
+    qty = Column(Numeric(18, 3), default=0)
+    rev = Column(Numeric(18, 3), default=0)
+    cost = Column(Numeric(18, 3), default=0)
+
+    __table_args__ = (
+        Index("ix_iraw_snap_item", "snapshot_id", "item_code"),
+        Index("ix_iraw_snap_cust", "snapshot_id", "cust_code"),
+    )
+
+
+class ItemRecord(Base):
+    """15차원 집계 결과 (~68,890건). 품목 대시보드 렌더용."""
+    __tablename__ = "item_records"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(
+        Integer, ForeignKey("item_snapshots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    yr = Column(Integer)
+    month = Column(Integer)
+    quarter = Column(String(4))
+    team = Column(String(50))
+    channel = Column(String(100))
+    country = Column(String(60))
+    customer = Column(String(200))
+    brand = Column(String(20))
+    theme = Column(String(100))
+    dl_cat = Column(String(100))
+    item_group = Column(String(100))
+    item_cat = Column(String(100))
+    sku = Column(String(30))
+    sku_name = Column(String(200))
+    sale_type = Column(String(20))
+    qty = Column(Numeric(18, 3), default=0)
+    rev = Column(Numeric(18, 3), default=0)
+    cost = Column(Numeric(18, 3), default=0)
+
+    __table_args__ = (
+        Index("ix_irec_snap_team", "snapshot_id", "team"),
+    )

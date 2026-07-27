@@ -15,6 +15,11 @@ from ..data.parser import (
     get_record_count,
     _AGGREGATE_THRESHOLD,
 )
+from ..data.item_parser import (
+    get_active_item_records,
+    get_active_item_snapshot_info,
+    get_cached_item_html,
+)
 
 router = APIRouter()
 
@@ -139,6 +144,12 @@ _NAV_STYLE = f"""
   justify-content:space-between;font-family:'Malgun Gothic',sans-serif;
   font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,.2)}}
 #__cms-topnav .nav-title{{color:#fff;font-weight:700;letter-spacing:-.3px}}
+#__cms-topnav .nav-links{{display:flex;gap:4px;align-items:center;margin-left:18px}}
+#__cms-topnav .nav-links a.nav-page{{color:rgba(255,255,255,.75);text-decoration:none;
+  padding:4px 12px;border-radius:6px;font-size:13px;font-weight:500}}
+#__cms-topnav .nav-links a.nav-page:hover{{background:rgba(255,255,255,.12);color:#fff}}
+#__cms-topnav .nav-links a.nav-page.active{{background:rgba(255,255,255,.2);color:#fff;font-weight:700}}
+#__cms-topnav .nav-left{{display:flex;align-items:center}}
 #__cms-topnav .nav-right{{display:flex;gap:14px;align-items:center}}
 #__cms-topnav .nav-user{{color:rgba(255,255,255,.75)}}
 #__cms-topnav a{{color:rgba(255,255,255,.85);text-decoration:none}}
@@ -175,7 +186,7 @@ _NAV_SCRIPT = f"""<script>
 </script>"""
 
 
-def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=None, current_snap_id: int = 0, hidden_routes: list = None) -> str:
+def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=None, current_snap_id: int = 0, hidden_routes: list = None, current_route: str = "") -> str:
     from ..models import AppConfig
 
     app_title = "CMS Lab 매출 대시보드"
@@ -213,9 +224,24 @@ def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=N
 </select>"""
 
     admin_link = '<a href="/admin">관리자</a>' if user.role == "admin" else ""
+
+    # 페이지 간 이동 링크 (권한 없는 페이지는 hidden_routes에 있으므로 제외)
+    _hidden = set(hidden_routes or [])
+    _nav_pages = [("/dashboard", "매출 대시보드"), ("/items", "품목별 매출")]
+    _link_parts = []
+    for route, label in _nav_pages:
+        if route in _hidden:
+            continue
+        cls = "nav-page active" if route == current_route else "nav-page"
+        _link_parts.append(f'<a href="{route}" class="{cls}">{label}</a>')
+    nav_links = f'<div class="nav-links">{"".join(_link_parts)}</div>' if _link_parts else ""
+
     nav = f"""{_NAV_STYLE}
 <div id="__cms-topnav">
-  <span class="nav-title">{app_title}</span>
+  <div class="nav-left">
+    <span class="nav-title">{app_title}</span>
+    {nav_links}
+  </div>
   <div class="nav-right">
     {week_selector}
     {date_badge}
@@ -281,7 +307,7 @@ async def dashboard(
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
     html = get_cached_html("dashboard", info["id"], current_user.allowed_teams, records, info["base_date"])
     return HTMLResponse(
-        _inject_nav(html, current_user, db, base_date=info["base_date"], snapshots=all_snaps, current_snap_id=info["id"], hidden_routes=hidden),
+        _inject_nav(html, current_user, db, base_date=info["base_date"], snapshots=all_snaps, current_snap_id=info["id"], hidden_routes=hidden, current_route="/dashboard"),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
@@ -311,6 +337,35 @@ async def compare(
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
     html = get_cached_html("compare", info["id"], current_user.allowed_teams, records, info["base_date"])
     return HTMLResponse(
-        _inject_nav(html, current_user, db, base_date=info["base_date"], snapshots=all_snaps, current_snap_id=info["id"], hidden_routes=hidden),
+        _inject_nav(html, current_user, db, base_date=info["base_date"], snapshots=all_snaps, current_snap_id=info["id"], hidden_routes=hidden, current_route="/compare"),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@router.get("/items", response_class=HTMLResponse)
+async def items(
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    if not current_user:
+        return RedirectResponse("/login", status_code=302)
+    group_team = db.query(Team).filter(Team.id == current_user.group_team_id).first() if current_user.group_team_id else None
+    if not can_access_tab(current_user, "items", group_team):
+        return HTMLResponse(_NO_ACCESS_HTML, status_code=403)
+
+    info = get_active_item_snapshot_info(db)
+    if not info:
+        return HTMLResponse(_NO_DATA_HTML)
+
+    records = get_active_item_records(db, current_user.allowed_teams)
+    if not records:
+        return HTMLResponse(_NO_DATA_HTML)
+
+    hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
+    html = get_cached_item_html(
+        info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
+    )
+    return HTMLResponse(
+        _inject_nav(html, current_user, db, base_date=info["base_date"], hidden_routes=hidden, current_route="/items"),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )

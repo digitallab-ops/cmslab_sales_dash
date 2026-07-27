@@ -113,6 +113,57 @@ body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5
         </div>
       </div>
 
+      <!-- 품목별 매출 데이터 업로드 -->
+      <div class="card p-4 mb-4 border-success border-opacity-25">
+        <h6 class="fw-bold mb-1">🧴 품목별 매출 데이터 업로드</h6>
+        <div class="text-muted mb-3" style="font-size:12px">
+          통합매출 2개 + 마스터 3개 파일을 올리면 서버가 원본을 DB에 적재하고 자동 집계합니다.
+          <strong>품목별 매출</strong> 탭에 반영됩니다. (수 분 소요)
+        </div>
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label">통합매출_2025 (.xlsx) <span class="text-danger">*</span></label>
+            <input type="file" id="item-sales-2025" class="form-control form-control-sm" accept=".xlsx" required>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">통합매출_2026 (.xlsx) <span class="text-danger">*</span></label>
+            <input type="file" id="item-sales-2026" class="form-control form-control-sm" accept=".xlsx" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">공장품목조회 (.xls) <span class="text-danger">*</span></label>
+            <input type="file" id="item-factory" class="form-control form-control-sm" accept=".xls,.xlsx" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">관리회계 기준정보 (.xlsx) <span class="text-danger">*</span></label>
+            <input type="file" id="item-acct" class="form-control form-control-sm" accept=".xlsx" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">팀참고 (.xlsx) <span class="text-muted" style="font-size:10px">(선택)</span></label>
+            <input type="file" id="item-team-ref" class="form-control form-control-sm" accept=".xlsx">
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-success btn-sm px-4" onclick="startItemUpload()">품목 데이터 업로드 &amp; 집계</button>
+        </div>
+        {% if item_info %}
+        <div class="text-muted mt-2" style="font-size:12px">
+          현재 반영: 원본 {{ '{:,}'.format(item_info.raw_count) }}건 · 집계 {{ '{:,}'.format(item_info.agg_count) }}건
+          · 기준 {{ item_info.base_date }} · 업로드 {{ item_info.uploaded_at }}
+        </div>
+        {% endif %}
+
+        <!-- 진행률 영역 -->
+        <div id="item-progress-area" style="display:none;margin-top:16px">
+          <div class="d-flex justify-content-between mb-1" style="font-size:13px">
+            <span id="item-status-msg" class="text-secondary">처리 중...</span>
+          </div>
+          <div class="progress" style="height:10px;border-radius:6px">
+            <div id="item-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-success"
+                 style="width:100%;transition:width .4s"></div>
+          </div>
+        </div>
+      </div>
+
       <!-- 변경사항 diff + 되돌리기 -->
       {% if diff %}
       <div class="card p-4 mb-4 border-primary border-opacity-50">
@@ -916,6 +967,63 @@ function _setUploadUI(msg, pct, colorClass) {
   document.getElementById('upload-pct').textContent = pct + '%';
   const bar = document.getElementById('upload-bar');
   bar.style.width = pct + '%';
+  bar.className = 'progress-bar progress-bar-striped progress-bar-animated ' + colorClass;
+}
+
+// ── 품목별 매출 데이터 업로드 (백그라운드) ────────────────────────────────────
+let _itemPollTimer = null;
+
+async function startItemUpload() {
+  const f2025 = document.getElementById('item-sales-2025');
+  const f2026 = document.getElementById('item-sales-2026');
+  const ffac  = document.getElementById('item-factory');
+  const facct = document.getElementById('item-acct');
+  const fteam = document.getElementById('item-team-ref');
+  if (!f2025.files.length || !f2026.files.length || !ffac.files.length || !facct.files.length) {
+    alert('통합매출 2개 + 공장품목조회 + 관리회계 기준정보는 필수입니다.'); return;
+  }
+
+  const fd = new FormData();
+  fd.append('sales_2025', f2025.files[0]);
+  fd.append('sales_2026', f2026.files[0]);
+  fd.append('factory', ffac.files[0]);
+  fd.append('acct', facct.files[0]);
+  if (fteam.files.length) fd.append('team_ref', fteam.files[0]);
+
+  document.getElementById('item-progress-area').style.display = 'block';
+  _setItemUI('업로드 중... (대용량 파일은 시간이 걸립니다)', 'bg-success');
+
+  let res, data;
+  try {
+    res = await fetch('/admin/upload-items', { method: 'POST', body: fd });
+    data = await res.json();
+  } catch(e) {
+    _setItemUI('❌ 네트워크 오류: ' + e, 'bg-danger'); return;
+  }
+  if (!res.ok) { _setItemUI('❌ ' + (data.detail || '업로드 실패'), 'bg-danger'); return; }
+
+  _pollItemStatus(data.task_id);
+}
+
+function _pollItemStatus(taskId) {
+  if (_itemPollTimer) clearInterval(_itemPollTimer);
+  _itemPollTimer = setInterval(async () => {
+    const r = await fetch(`/admin/upload-status/${taskId}`);
+    const t = await r.json();
+    const color = t.status === 'error' ? 'bg-danger' : t.status === 'done' ? 'bg-success' : 'bg-success';
+    _setItemUI(t.message, color);
+    if (t.status === 'done') {
+      clearInterval(_itemPollTimer);
+      setTimeout(() => location.reload(), 2000);
+    } else if (t.status === 'error') {
+      clearInterval(_itemPollTimer);
+    }
+  }, 2000);
+}
+
+function _setItemUI(msg, colorClass) {
+  document.getElementById('item-status-msg').textContent = msg;
+  const bar = document.getElementById('item-bar');
   bar.className = 'progress-bar progress-bar-striped progress-bar-animated ' + colorClass;
 }
 

@@ -22,6 +22,7 @@ from ..data.parser import (
     rollback_to_previous,
     get_upload_diff,
 )
+from ..data.item_parser import save_item_upload, get_active_item_snapshot_info
 
 router = APIRouter(prefix="/admin")
 _tpl_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
@@ -79,6 +80,7 @@ async def admin_page(
     }
     diff = get_upload_diff(db)
     all_snapshots = get_all_snapshots(db)
+    item_info = get_active_item_snapshot_info(db)
     return templates.TemplateResponse("admin.html", {
         "request": request,
         "user": current_user,
@@ -92,6 +94,7 @@ async def admin_page(
         "msg": msg,
         "diff": diff,
         "tabs": TABS,
+        "item_info": item_info,
     })
 
 
@@ -180,6 +183,61 @@ async def upload_status(
     if not task:
         raise HTTPException(404, "태스크를 찾을 수 없습니다.")
     return task
+
+
+# ─── 품목별 매출 데이터 업로드 (엑셀 5종) ─────────────────────────────────────
+
+def _run_item_upload_task(task_id: str, paths: dict, user_id: int):
+    """백그라운드 스레드: 원본 적재 → DB 집계 → item_records 저장."""
+    db = SessionLocal()
+    try:
+        result = save_item_upload(db, paths, uploaded_by=user_id, task_id=task_id)
+        _set_task(
+            task_id, status="done",
+            progress=result["agg"], total=result["agg"],
+            message=f"✅ 완료: 원본 {result['raw']:,}건 · 집계 {result['agg']:,}건 ({result['base_date']})",
+        )
+    except Exception as e:
+        _set_task(task_id, status="error", message=f"❌ 오류: {e}")
+    finally:
+        db.close()
+        for p in paths.values():
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+@router.post("/upload-items")
+async def upload_items(
+    sales_2025: UploadFile = File(...),
+    sales_2026: UploadFile = File(...),
+    factory: UploadFile = File(...),
+    acct: UploadFile = File(...),
+    team_ref: Optional[UploadFile] = File(None),
+    current_user: User = Depends(require_admin),
+):
+    async def _save(uf: Optional[UploadFile], suffix: str) -> Optional[str]:
+        if uf is None:
+            return None
+        content = await uf.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            return tmp.name
+
+    paths = {
+        "sales_2025": await _save(sales_2025, ".xlsx"),
+        "sales_2026": await _save(sales_2026, ".xlsx"),
+        "factory":    await _save(factory, ".xls"),
+        "acct":       await _save(acct, ".xlsx"),
+        "team_ref":   await _save(team_ref, ".xlsx"),
+    }
+
+    task_id = create_upload_task()
+    t = threading.Thread(target=_run_item_upload_task, args=(task_id, paths, current_user.id), daemon=True)
+    t.start()
+    return JSONResponse({"task_id": task_id})
 
 
 # ─── 수동 입력 (Import Form) ─────────────────────────────────────────────────

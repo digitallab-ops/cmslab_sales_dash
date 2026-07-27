@@ -1,0 +1,14 @@
+{
+  "_comment": "이 파일을 Claude Desktop 설정에 복사하세요: %APPDATA%\\Claude\\claude_desktop_config.json",
+  "mcpServers": {
+    "cms-unified": {
+      "command": "python",
+      "args": ["C:\\loki_project\\sales_dashboard\\sales_dashboard_web\\mcp_unified.py"],
+      "env": {
+        "SALES_API_URL": "https://your-app.onrender.com",
+        "SALES_API_KEY": "여기에_/admin에서_발급받은_API_키_입력",
+        "CHANNEL_MCP_API_KEY": "여기에_채널MCP_Bearer_토큰_입력"
+      }
+    }
+  }
+}
