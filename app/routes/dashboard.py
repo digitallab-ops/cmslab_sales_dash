@@ -1,6 +1,7 @@
+import gzip
 from typing import Optional
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -196,6 +197,21 @@ _NAV_SCRIPT = f"""<script>
   }}).observe(p, {{attributes:true, attributeFilter:['style']}});
 }})();
 </script>"""
+
+
+_NOCACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
+
+def _html_response(html: str, request: Request, headers: dict = None) -> Response:
+    """대용량 HTML은 gzip으로 압축해 응답(브라우저가 gzip 허용 시). 25MB → ~3MB 전송."""
+    h = dict(headers or {})
+    accept = request.headers.get("accept-encoding", "").lower()
+    if "gzip" in accept and len(html) > 4096:
+        body = gzip.compress(html.encode("utf-8"), compresslevel=5)
+        h["Content-Encoding"] = "gzip"
+        h["Vary"] = "Accept-Encoding"
+        return Response(content=body, media_type="text/html; charset=utf-8", headers=h)
+    return HTMLResponse(html, headers=h)
 
 
 def _inject_nav(html: str, user: User, db=None, base_date: str = "", snapshots=None, current_snap_id: int = 0, hidden_routes: list = None, current_route: str = "", date_bounds=None, date_from=None, date_to=None) -> str:
@@ -425,8 +441,6 @@ async def items(
             info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
         )
 
-    return HTMLResponse(
-        _inject_nav(html, current_user, db, base_date=info["base_date"], hidden_routes=hidden,
-                    current_route="/items", date_bounds=bounds, date_from=d_from, date_to=d_to),
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
-    )
+    final = _inject_nav(html, current_user, db, base_date=info["base_date"], hidden_routes=hidden,
+                        current_route="/items", date_bounds=bounds, date_from=d_from, date_to=d_to)
+    return _html_response(final, request, _NOCACHE)
