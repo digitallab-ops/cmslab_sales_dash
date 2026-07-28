@@ -697,7 +697,7 @@ def build_sku_map(records, ordered_groups, tree_meta):
     return sku_map
 
 
-def make_html(records, chartjs_src, base_date='', channel_order=None):
+def make_html(records, chartjs_src, base_date='', channel_order=None, data_url=None):
     channel_order = channel_order or []
     channel_order_json = json.dumps(channel_order, ensure_ascii=False, separators=(',', ':'))
     tree_meta = build_tree_meta(records)
@@ -708,8 +708,24 @@ def make_html(records, chartjs_src, base_date='', channel_order=None):
     countries = sorted({r['country'] for r in records if r.get('country')})
     all_channels = sorted({r['channel'] for r in records if r['channel']})
 
-    data_json = json.dumps(records, ensure_ascii=False, separators=(',', ':'))
     tree_json = json.dumps(tree_meta, ensure_ascii=False)
+
+    # 데이터 전달 방식: data_url이 있으면 RAW를 비우고 그 URL에서 fetch(온디맨드),
+    # 없으면 기존처럼 RAW를 HTML에 임베드. (계산 로직은 어느 쪽이든 동일)
+    if data_url:
+        raw_decl = "let RAW = [];"
+        init_js = (
+            "fetch(" + json.dumps(data_url) + " + location.search)"
+            ".then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })"
+            ".then(function(d){ RAW.length=0; for(var i=0;i<d.length;i++) RAW.push(d[i]);"
+            " refreshAllDropdowns(); renderNow(); alignQuarterToYear(); })"
+            ".catch(function(e){ document.body.insertAdjacentHTML('afterbegin',"
+            "'<div style=\"padding:24px;font-family:sans-serif;color:#b91c1c\">데이터 로딩 실패: '+e+'</div>'); });"
+        )
+    else:
+        data_json = json.dumps(records, ensure_ascii=False, separators=(',', ':'))
+        raw_decl = "const RAW  = " + data_json + ";"
+        init_js = "refreshAllDropdowns();\n  renderNow();\n  alignQuarterToYear();"
 
     if chartjs_src:
         chartjs_tag = f'<script>{chartjs_src}</script>'
@@ -1100,7 +1116,7 @@ def make_html(records, chartjs_src, base_date='', channel_order=None):
 
 <script>
 'use strict';
-const RAW  = {data_json};
+{raw_decl}
 const TREE = {tree_json};
 const GRP_ORDER = {grp_order_json};
 const SKU_MAP = {sku_map_json};   // (gi_ci) → [{{sku, sku_name}}]
@@ -2764,9 +2780,7 @@ function _renderImpl(){{
 }}
 let _table2Cancel = null;
 
-refreshAllDropdowns();
-renderNow();          // 초기 로드는 디바운스 없이 즉시
-alignQuarterToYear();
+{init_js}
 window.addEventListener('resize', () => {{
   updateStickyOffsets();
   if(_expandedChart) applyExpandRect(document.getElementById(_expandedChart.cardId));

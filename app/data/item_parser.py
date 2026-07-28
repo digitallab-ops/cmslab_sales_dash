@@ -573,13 +573,54 @@ def get_cached_item_html(snapshot_id: int, allowed_teams: Optional[List[str]],
     return html
 
 
+## ─── 온디맨드(DB 직결): 쉘 + 데이터 API ──────────────────────────────────────
+
+ITEM_DATA_URL = "/items/data"
+
+
+def make_item_shell(records: List[Dict], base_date: str, channel_order: list) -> str:
+    """데이터(RAW) 없이 화면·로직만 담은 쉘. RAW는 브라우저가 ITEM_DATA_URL에서 fetch.
+    records는 메타데이터(TREE/GRP_ORDER/SKU_MAP) 계산용으로만 사용된다."""
+    global _chartjs_cache
+    mod = _load_item_mod()
+    if _chartjs_cache is None:
+        _chartjs_cache = mod.load_chartjs()
+    return mod.make_html(records, _chartjs_cache, base_date,
+                         channel_order=channel_order, data_url=ITEM_DATA_URL)
+
+
+def get_cached_item_shell(snapshot_id: int, allowed_teams: Optional[List[str]],
+                          records: List[Dict], base_date: str, channel_order: list) -> str:
+    key = (snapshot_id, _p._teams_key(allowed_teams), "items-shell")
+    if key in _p._html_cache:
+        return _p._html_cache[key]
+    html = make_item_shell(records, base_date, channel_order)
+    _p._html_cache[key] = html
+    return html
+
+
+def get_cached_item_data_gz(snapshot_id: int, allowed_teams: Optional[List[str]],
+                            date_from: Optional[int], date_to: Optional[int],
+                            records: List[Dict]) -> bytes:
+    """RAW 레코드 JSON을 gzip bytes로 캐시. 키에 팀·날짜범위 포함."""
+    import gzip
+    tag = f"data:{date_from}:{date_to}" if (date_from and date_to) else "data"
+    key = (snapshot_id, _p._teams_key(allowed_teams), tag)
+    cached = _p._html_cache.get(key)
+    if cached is not None:
+        return cached
+    payload = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    gz = gzip.compress(payload, compresslevel=5)
+    _p._html_cache[key] = gz
+    return gz
+
+
 def prewarm_item_cache(db: Session):
-    """업로드 완료 후 전체(all-teams) HTML만 미리 생성.
-    품목 HTML은 ~25MB로 크므로 팀별 조합은 캐시 폭증을 막기 위해 최초 접근 시 지연 생성한다.
-    """
+    """업로드 완료 후 전체(all-teams) 쉘 + 데이터를 미리 생성."""
     info = get_active_item_snapshot_info(db)
     if not info:
         return
     records = get_active_item_records(db, allowed_teams=None)
     if records:
-        get_cached_item_html(info["id"], None, records, info["base_date"], info["channel_order"])
+        get_cached_item_shell(info["id"], None, records, info["base_date"], info["channel_order"])
+        get_cached_item_data_gz(info["id"], None, None, None, records)

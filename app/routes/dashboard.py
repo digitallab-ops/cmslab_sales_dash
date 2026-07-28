@@ -19,7 +19,8 @@ from ..data.parser import (
 from ..data.item_parser import (
     get_active_item_records,
     get_active_item_snapshot_info,
-    get_cached_item_html,
+    get_cached_item_shell,
+    get_cached_item_data_gz,
     aggregate_range_records,
     get_item_date_bounds,
 )
@@ -415,32 +416,54 @@ async def items(
     if not info:
         return HTMLResponse(_NO_DATA_HTML)
 
-    # 날짜 범위 파라미터 (?from=YYYY-MM-DD&to=YYYY-MM-DD)
+    # 쉘(화면·로직)만 생성 — 실데이터(RAW)는 브라우저가 /items/data 에서 fetch.
+    # 메타데이터(TREE/GRP_ORDER/SKU_MAP) 계산용으로 활성 스냅샷 레코드를 사용.
+    records = get_active_item_records(db, current_user.allowed_teams)
+    if not records:
+        return HTMLResponse(_NO_DATA_HTML)
+
     d_from = _parse_date_param(request.query_params.get("from", ""))
     d_to = _parse_date_param(request.query_params.get("to", ""))
-    bounds = get_item_date_bounds(db, info["id"])   # (min, max) or None
-
+    bounds = get_item_date_bounds(db, info["id"])
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
 
-    if d_from and d_to and d_from <= d_to:
-        # 지정 구간만 즉석 재집계
-        records = aggregate_range_records(db, info["id"], d_from, d_to, current_user.allowed_teams)
-        if not records:
-            return HTMLResponse(_NO_DATA_HTML)
-        def _fmt(n): return f"{n//10000}-{(n//100)%100:02d}-{n%100:02d}"
-        label = f"{_fmt(d_from)} ~ {_fmt(d_to)}"
-        html = get_cached_item_html(
-            info["id"], current_user.allowed_teams, records, label, info["channel_order"],
-            cache_tag=f"items:{d_from}:{d_to}",
-        )
-    else:
-        records = get_active_item_records(db, current_user.allowed_teams)
-        if not records:
-            return HTMLResponse(_NO_DATA_HTML)
-        html = get_cached_item_html(
-            info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
-        )
-
-    final = _inject_nav(html, current_user, db, base_date=info["base_date"], hidden_routes=hidden,
+    shell = get_cached_item_shell(
+        info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
+    )
+    final = _inject_nav(shell, current_user, db, base_date=info["base_date"], hidden_routes=hidden,
                         current_route="/items", date_bounds=bounds, date_from=d_from, date_to=d_to)
     return _html_response(final, request, _NOCACHE)
+
+
+@router.get("/items/data")
+async def items_data(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """품목 대시보드 실데이터(RAW) — DB에서 조회해 gzip JSON으로 반환. 팀권한·날짜범위 반영."""
+    if not current_user:
+        return Response("[]", status_code=401, media_type="application/json")
+    group_team = db.query(Team).filter(Team.id == current_user.group_team_id).first() if current_user.group_team_id else None
+    if not can_access_tab(current_user, "items", group_team):
+        return Response("[]", status_code=403, media_type="application/json")
+
+    info = get_active_item_snapshot_info(db)
+    if not info:
+        return Response("[]", media_type="application/json")
+
+    d_from = _parse_date_param(request.query_params.get("from", ""))
+    d_to = _parse_date_param(request.query_params.get("to", ""))
+    if d_from and d_to and d_from <= d_to:
+        records = aggregate_range_records(db, info["id"], d_from, d_to, current_user.allowed_teams)
+    else:
+        records = get_active_item_records(db, current_user.allowed_teams)
+
+    gz = get_cached_item_data_gz(info["id"], current_user.allowed_teams, d_from, d_to, records)
+    if "gzip" in request.headers.get("accept-encoding", "").lower():
+        return Response(gz, media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding",
+                                 "Cache-Control": "no-store"})
+    import gzip as _gz
+    return Response(_gz.decompress(gz), media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
