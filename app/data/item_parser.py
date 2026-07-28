@@ -68,6 +68,97 @@ def _pg_connect():
     return psycopg2.connect(DATABASE_URL)
 
 
+# ─── 스트리밍 xlsx 리더 (openpyxl read_only 메모리 누수 회피, 메모리 일정) ─────
+# openpyxl read_only는 행을 읽을수록 메모리를 계속 점유(150만 행 → 수백MB → OOM).
+# 통합매출 대용량 파일은 zip+XML iterparse로 직접 스트리밍해 메모리를 평탄하게 유지한다.
+
+_XL_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+
+def _xl_col_index(ref: str) -> int:
+    s = ''.join(ch for ch in ref if ch.isalpha())
+    n = 0
+    for ch in s:
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n - 1
+
+
+def _xl_shared_strings(z):
+    from xml.etree import ElementTree as ET
+    import io
+    ss = []
+    try:
+        data = z.read('xl/sharedStrings.xml')
+    except KeyError:
+        return ss
+    for _, el in ET.iterparse(io.BytesIO(data), events=('end',)):
+        if el.tag == _XL_NS + 'si':
+            ss.append(''.join(t.text or '' for t in el.iter(_XL_NS + 't')))
+            el.clear()
+    return ss
+
+
+def _xl_active_sheet(z) -> str:
+    import re
+    wb = z.read('xl/workbook.xml').decode('utf-8', 'ignore')
+    m = re.search(r'<sheet[^>]*r:id="([^"]+)"', wb)
+    target = None
+    if m:
+        rid = m.group(1)
+        rels = z.read('xl/_rels/workbook.xml.rels').decode('utf-8', 'ignore')
+        m2 = (re.search(r'Id="' + re.escape(rid) + r'"[^>]*Target="([^"]+)"', rels)
+              or re.search(r'Target="([^"]+)"[^>]*Id="' + re.escape(rid) + r'"', rels))
+        if m2:
+            target = m2.group(1)
+    target = (target or 'worksheets/sheet1.xml').lstrip('/')
+    if not target.startswith('xl/'):
+        target = 'xl/' + target
+    return target
+
+
+def _iter_xlsx_rows(path: str, min_row: int = 1):
+    """xlsx 시트를 (열 인덱스순) 값 리스트로 스트리밍. 메모리 일정."""
+    import zipfile
+    from xml.etree import ElementTree as ET
+    z = zipfile.ZipFile(path)
+    try:
+        ss = _xl_shared_strings(z)
+        sheet = _xl_active_sheet(z)
+        with z.open(sheet) as f:
+            context = ET.iterparse(f, events=('start', 'end'))
+            _, root = next(context)
+            for ev, el in context:
+                if ev == 'end' and el.tag == _XL_NS + 'row':
+                    if int(el.get('r', '0')) >= min_row:
+                        vals, maxc = {}, -1
+                        for c in el:
+                            if c.tag != _XL_NS + 'c':
+                                continue
+                            ci = _xl_col_index(c.get('r', ''))
+                            t = c.get('t')
+                            v = c.find(_XL_NS + 'v')
+                            if v is not None:
+                                text = v.text
+                            else:
+                                ise = c.find(_XL_NS + 'is')
+                                text = ''.join(tt.text or '' for tt in ise.iter(_XL_NS + 't')) if ise is not None else None
+                            if t == 's' and text is not None:
+                                try:
+                                    val = ss[int(text)]
+                                except (ValueError, IndexError):
+                                    val = None
+                            else:
+                                val = text
+                            vals[ci] = val
+                            if ci > maxc:
+                                maxc = ci
+                        yield [vals.get(i) for i in range(maxc + 1)]
+                    el.clear()
+                    root.clear()
+    finally:
+        z.close()
+
+
 # ─── 1) 원본 적재 (스트리밍 → COPY, 전용 커넥션) ──────────────────────────────
 
 _COPY_COLS = ["snapshot_id", "yr", "date_int", "cust_code", "cust_name",
@@ -82,12 +173,11 @@ _REC_COLS = ["snapshot_id"] + _DIMS + ["qty", "rev", "cost"]
 def ingest_raw(conn, snapshot_id: int, xlsx_path: str, yr: int,
                base_count: int = 0, task_id: Optional[str] = None) -> int:
     """통합매출 xlsx를 스트리밍하며 item_raw에 Postgres COPY로 적재 (전용 커넥션).
-    청크마다 커밋 + item_snapshots.raw_count를 갱신해 진행상황을 DB에 남긴다. 적재 건수 반환."""
-    import io, csv, openpyxl
+    청크마다 커밋 + item_snapshots.raw_count를 갱신해 진행상황을 DB에 남긴다. 적재 건수 반환.
+    xlsx는 openpyxl(메모리 누수) 대신 스트리밍 리더로 읽어 메모리를 평탄하게 유지."""
+    import io, csv
     from ..database import SCHEMA
 
-    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
-    ws = wb.active
     copy_sql = f'COPY {SCHEMA}.item_raw ({",".join(_COPY_COLS)}) FROM STDIN WITH (FORMAT csv)'
 
     sio = io.StringIO()
@@ -114,13 +204,16 @@ def ingest_raw(conn, snapshot_id: int, xlsx_path: str, yr: int,
         if task_id:
             _p._set_task(task_id, message=f"원본 적재 중 ({yr}년, {base_count + inserted:,}건)")
 
+    def _cell(row, i):
+        return row[i] if i < len(row) else None
+
     # pilot load_sales 와 동일한 컬럼 인덱스/필터 (min_row=3)
-    for row in ws.iter_rows(min_row=3, values_only=True):
-        date_val = row[1]; cust_raw = row[2]
-        cust_nm  = row[3] if len(row) > 3 else None
-        sku_raw  = row[4]
-        item_nm  = row[5] if len(row) > 5 else None
-        qty  = float(row[6] or 0); rev = float(row[7] or 0); cost = float(row[8] or 0)
+    for row in _iter_xlsx_rows(xlsx_path, min_row=3):
+        date_val = _cell(row, 1); cust_raw = _cell(row, 2)
+        cust_nm  = _cell(row, 3)
+        sku_raw  = _cell(row, 4)
+        item_nm  = _cell(row, 5)
+        qty  = float(_cell(row, 6) or 0); rev = float(_cell(row, 7) or 0); cost = float(_cell(row, 8) or 0)
         if not (date_val and sku_raw and (rev or qty)):
             continue
         try:
@@ -142,7 +235,6 @@ def ingest_raw(conn, snapshot_id: int, xlsx_path: str, yr: int,
             _flush()
 
     _flush()
-    wb.close()
     return inserted
 
 
