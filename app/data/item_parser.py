@@ -178,7 +178,8 @@ def ingest_raw(conn, snapshot_id: int, xlsx_path: str, yr: int,
     import io, csv
     from ..database import SCHEMA
 
-    copy_sql = f'COPY {SCHEMA}.item_raw ({",".join(_COPY_COLS)}) FROM STDIN WITH (FORMAT csv)'
+    # NULL 마커를 특수 문자열로 지정 → 빈 문자열('')이 NULL로 저장되는 CSV 기본동작 회피
+    copy_sql = f"COPY {SCHEMA}.item_raw ({','.join(_COPY_COLS)}) FROM STDIN WITH (FORMAT csv, NULL '\\N')"
 
     sio = io.StringIO()
     writer = csv.writer(sio, lineterminator="\n")
@@ -315,7 +316,7 @@ def aggregate_from_db(conn, snapshot_id: int, mod, masters,
     rcur.close()
 
     # item_records COPY 저장
-    copy_sql = f'COPY {SCHEMA}.item_records ({",".join(_REC_COLS)}) FROM STDIN WITH (FORMAT csv)'
+    copy_sql = f"COPY {SCHEMA}.item_records ({','.join(_REC_COLS)}) FROM STDIN WITH (FORMAT csv, NULL '\\N')"
     sio = io.StringIO(); writer = csv.writer(sio, lineterminator="\n")
     buf = 0; agg = 0
     wcur = conn.cursor()
@@ -543,11 +544,11 @@ def get_active_item_records(db: Session, allowed_teams: Optional[List[str]] = No
     out = []
     for r in q.yield_per(10000):
         out.append({
-            "yr": r.yr, "month": r.month, "quarter": r.quarter,
-            "team": r.team, "channel": r.channel, "country": r.country,
-            "customer": r.customer, "brand": r.brand, "theme": r.theme,
-            "dl_cat": r.dl_cat, "item_group": r.item_group, "item_cat": r.item_cat,
-            "sku": r.sku, "sku_name": r.sku_name, "sale_type": r.sale_type,
+            "yr": r.yr, "month": r.month, "quarter": r.quarter or "",
+            "team": r.team or "", "channel": r.channel or "", "country": r.country or "",
+            "customer": r.customer or "", "brand": r.brand or "", "theme": r.theme or "",
+            "dl_cat": r.dl_cat or "", "item_group": r.item_group or "", "item_cat": r.item_cat or "",
+            "sku": r.sku or "", "sku_name": r.sku_name or "", "sale_type": r.sale_type or "",
             "qty": int(r.qty or 0), "rev": int(r.rev or 0), "cost": int(r.cost or 0),
         })
     return out
