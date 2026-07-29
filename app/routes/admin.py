@@ -412,6 +412,8 @@ async def manage_users(
             user.allowed_teams = body["allowed_teams"] or None
         if "allowed_tabs" in body:
             user.allowed_tabs = body["allowed_tabs"] or None
+        if "tab_perms" in body:
+            user.tab_perms = body["tab_perms"] or None   # None = 그룹 상속/전체
         if "group_team_id" in body:
             user.group_team_id = body["group_team_id"] or None
         if body.get("password"):
@@ -466,6 +468,8 @@ async def manage_teams(
             team.is_active = body["is_active"]
         if "allowed_tabs" in body:
             team.allowed_tabs = body["allowed_tabs"] or None
+        if "tab_perms" in body:
+            team.tab_perms = body["tab_perms"] or None
         db.commit()
         return {"ok": True}
 

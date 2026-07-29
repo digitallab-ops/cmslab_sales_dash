@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..auth import get_current_user
 from ..models import User, Team
-from ..tab_registry import can_access_tab, TABS
+from ..tab_registry import can_access_tab, tab_teams, TABS
 from ..data.parser import (
     get_active_records,
     get_active_snapshot_info,
@@ -347,13 +347,14 @@ async def dashboard(
         return HTMLResponse(_NO_DATA_HTML)
 
     use_agg = get_record_count(db, snapshot_id=info["id"]) > _AGGREGATE_THRESHOLD
-    records = get_active_records(db, current_user.allowed_teams, aggregated=use_agg, snapshot_id=info["id"])
+    teams = tab_teams(current_user, "dashboard", group_team)
+    records = get_active_records(db, teams, aggregated=use_agg, snapshot_id=info["id"])
     if not records:
         return HTMLResponse(_NO_DATA_HTML)
 
     all_snaps = get_all_snapshots(db)
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
-    html = get_cached_html("dashboard", info["id"], current_user.allowed_teams, records, info["base_date"])
+    html = get_cached_html("dashboard", info["id"], teams, records, info["base_date"])
     return HTMLResponse(
         _inject_nav(html, current_user, db, base_date=info["base_date"], snapshots=all_snaps, current_snap_id=info["id"], hidden_routes=hidden, current_route="/dashboard"),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
@@ -377,13 +378,14 @@ async def compare(
         return HTMLResponse(_NO_DATA_HTML)
 
     use_agg = get_record_count(db, snapshot_id=info["id"]) > _AGGREGATE_THRESHOLD
-    records = get_active_records(db, current_user.allowed_teams, aggregated=use_agg, snapshot_id=info["id"])
+    teams = tab_teams(current_user, "compare", group_team)
+    records = get_active_records(db, teams, aggregated=use_agg, snapshot_id=info["id"])
     if not records:
         return HTMLResponse(_NO_DATA_HTML)
 
     all_snaps = get_all_snapshots(db)
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
-    html = get_cached_html("compare", info["id"], current_user.allowed_teams, records, info["base_date"])
+    html = get_cached_html("compare", info["id"], teams, records, info["base_date"])
     return HTMLResponse(
         _inject_nav(html, current_user, db, base_date=info["base_date"], snapshots=all_snaps, current_snap_id=info["id"], hidden_routes=hidden, current_route="/compare"),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
@@ -418,7 +420,8 @@ async def items(
 
     # 쉘(화면·로직)만 생성 — 실데이터(RAW)는 브라우저가 /items/data 에서 fetch.
     # 메타데이터(TREE/GRP_ORDER/SKU_MAP) 계산용으로 활성 스냅샷 레코드를 사용.
-    records = get_active_item_records(db, current_user.allowed_teams)
+    teams = tab_teams(current_user, "items", group_team)
+    records = get_active_item_records(db, teams)
     if not records:
         return HTMLResponse(_NO_DATA_HTML)
 
@@ -428,7 +431,7 @@ async def items(
     hidden = [t["route"] for t in TABS if not can_access_tab(current_user, t["id"], group_team)]
 
     shell = get_cached_item_shell(
-        info["id"], current_user.allowed_teams, records, info["base_date"], info["channel_order"]
+        info["id"], teams, records, info["base_date"], info["channel_order"]
     )
     final = _inject_nav(shell, current_user, db, base_date=info["base_date"], hidden_routes=hidden,
                         current_route="/items", date_bounds=bounds, date_from=d_from, date_to=d_to)
@@ -452,14 +455,15 @@ async def items_data(
     if not info:
         return Response("[]", media_type="application/json")
 
+    teams = tab_teams(current_user, "items", group_team)
     d_from = _parse_date_param(request.query_params.get("from", ""))
     d_to = _parse_date_param(request.query_params.get("to", ""))
     if d_from and d_to and d_from <= d_to:
-        records = aggregate_range_records(db, info["id"], d_from, d_to, current_user.allowed_teams)
+        records = aggregate_range_records(db, info["id"], d_from, d_to, teams)
     else:
-        records = get_active_item_records(db, current_user.allowed_teams)
+        records = get_active_item_records(db, teams)
 
-    gz = get_cached_item_data_gz(info["id"], current_user.allowed_teams, d_from, d_to, records)
+    gz = get_cached_item_data_gz(info["id"], teams, d_from, d_to, records)
     if "gzip" in request.headers.get("accept-encoding", "").lower():
         return Response(gz, media_type="application/json",
                         headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding",

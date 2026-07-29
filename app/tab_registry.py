@@ -10,16 +10,31 @@ TABS = [
 ]
 
 
-def can_access_tab(user, tab_id: str, group_team=None) -> bool:
-    """탭 접근 권한 확인.
-
-    우선순위: 개인 설정 → 그룹 기본값 → 전체 허용
-    - user.allowed_tabs 가 있으면 개인 설정 사용
-    - 없으면 group_team.allowed_tabs 확인
-    - 둘 다 없으면 전체 허용
+def resolve_perms(user, group_team=None):
+    """유효 tab_perms 반환. 개인 설정 → 그룹 기본값 → None(전체 탭·전체 팀).
+    tab_perms = {tab_id: "ALL"|[teams]}. 키 없으면 그 탭 접근 불가.
     """
-    if user.allowed_tabs is not None:
-        return tab_id in user.allowed_tabs
-    if group_team is not None and group_team.allowed_tabs is not None:
-        return tab_id in group_team.allowed_tabs
-    return True
+    if getattr(user, "tab_perms", None) is not None:
+        return user.tab_perms
+    if group_team is not None and getattr(group_team, "tab_perms", None) is not None:
+        return group_team.tab_perms
+    return None
+
+
+def can_access_tab(user, tab_id: str, group_team=None) -> bool:
+    """탭 접근 권한 확인. tab_perms가 없으면(NULL 상속) 전체 허용."""
+    perms = resolve_perms(user, group_team)
+    if perms is None:
+        return True
+    return tab_id in perms
+
+
+def tab_teams(user, tab_id: str, group_team=None):
+    """해당 탭에서 볼 수 있는 팀 목록. None = 전체 팀(제한 없음)."""
+    perms = resolve_perms(user, group_team)
+    if perms is None:
+        return None
+    scope = perms.get(tab_id)
+    if scope is None or scope == "ALL":
+        return None
+    return scope if scope else None

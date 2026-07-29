@@ -63,17 +63,62 @@ def _run_migrations():
         db.execute(text(
             f"ALTER TABLE {SCHEMA}.teams ADD COLUMN IF NOT EXISTS allowed_tabs TEXT"
         ))
+        # 탭별 권한(tab_perms) 컬럼
+        db.execute(text(
+            f"ALTER TABLE {SCHEMA}.users ADD COLUMN IF NOT EXISTS tab_perms TEXT"
+        ))
+        db.execute(text(
+            f"ALTER TABLE {SCHEMA}.teams ADD COLUMN IF NOT EXISTS tab_perms TEXT"
+        ))
         # 관리자는 이메일 인증 없이 바로 로그인 가능해야 함
         db.execute(text(
             f"UPDATE {SCHEMA}.users SET email_verified = TRUE WHERE role = 'admin'"
         ))
         db.commit()
+        _backfill_tab_perms(db)
         print("[Migration] 완료")
     except Exception as e:
         print(f"[Migration] 오류: {e}")
         db.rollback()
     finally:
         db.close()
+
+
+def _backfill_tab_perms(db):
+    """기존 allowed_tabs/allowed_teams → tab_perms 일회성 백필.
+    제한이 있는 대상만 채우고, 무제한(둘 다 NULL) 사용자는 NULL 유지(=전체).
+    """
+    from .models import User, Team
+    from .tab_registry import TABS
+    all_tab_ids = [t["id"] for t in TABS]
+    try:
+        # 그룹(Team): allowed_tabs 있으면 tab_perms={tab:"ALL"}
+        for team in db.query(Team).all():
+            if team.tab_perms is not None:
+                continue
+            if team.allowed_tabs:
+                team.tab_perms = {tid: "ALL" for tid in team.allowed_tabs}
+        db.flush()
+
+        for u in db.query(User).all():
+            if u.tab_perms is not None:
+                continue
+            if not u.allowed_tabs and not u.allowed_teams:
+                continue   # 무제한 → NULL 유지(전체 탭·전체 팀)
+            # 접근 가능 탭: 개인 allowed_tabs → 그룹 allowed_tabs → 전체
+            tabs = u.allowed_tabs
+            if not tabs and u.group_team_id:
+                grp = db.query(Team).filter(Team.id == u.group_team_id).first()
+                tabs = grp.allowed_tabs if (grp and grp.allowed_tabs) else None
+            if not tabs:
+                tabs = all_tab_ids
+            scope = list(u.allowed_teams) if u.allowed_teams else "ALL"
+            u.tab_perms = {tid: scope for tid in tabs}
+        db.commit()
+        print("[Migration] tab_perms 백필 완료")
+    except Exception as e:
+        print(f"[Migration] tab_perms 백필 오류: {e}")
+        db.rollback()
 
 
 def _create_first_admin():

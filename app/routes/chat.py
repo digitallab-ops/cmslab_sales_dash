@@ -107,7 +107,10 @@ async def chat(
 
     model = req.model if req.model in ALLOWED_MODELS else "gpt-4o-mini"
 
-    sales_ctx = _build_sales_context(db, current_user.allowed_teams)
+    from ..tab_registry import tab_teams
+    from ..models import Team
+    group_team = db.query(Team).filter(Team.id == current_user.group_team_id).first() if current_user.group_team_id else None
+    sales_ctx = _build_sales_context(db, tab_teams(current_user, "dashboard", group_team))
 
     system_prompt = f"""당신은 CMS Lab 매출 대시보드 AI 분석 어시스턴트입니다.
 현재 사용자: {current_user.name or current_user.email} ({'관리자' if current_user.role == 'admin' else '일반 사용자'})

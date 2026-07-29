@@ -29,6 +29,27 @@ class TextList(TypeDecorator):
         return value
 
 
+class JSONField(TypeDecorator):
+    """dict/list를 JSON 문자열로 저장하는 타입 (NULL 허용). tab_perms 용."""
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False)
+
+    def process_result_value(self, value, dialect):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return None
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -37,8 +58,9 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     name = Column(String(100), default="")
     role = Column(String(20), default="viewer")         # 'admin' | 'viewer'
-    allowed_teams = Column(TextList, nullable=True)     # NULL = 전체 팀 열람
-    allowed_tabs  = Column(TextList, nullable=True)     # NULL = 그룹 기본값 상속 또는 전체
+    allowed_teams = Column(TextList, nullable=True)     # (구) 전역 팀 범위 — tab_perms로 대체, 보존용
+    allowed_tabs  = Column(TextList, nullable=True)     # (구) 탭 접근 — tab_perms로 대체, 보존용
+    tab_perms     = Column(JSONField, nullable=True)    # 탭별 권한 {tab_id: "ALL"|[teams]}. NULL=그룹상속/전체
     group_team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)  # 탭 권한 상속 그룹
     is_active = Column(Boolean, default=True)
     email_verified = Column(Boolean, default=False)
@@ -118,7 +140,8 @@ class Team(Base):
     name = Column(String(100), unique=True, nullable=False)
     display_order = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
-    allowed_tabs = Column(TextList, nullable=True)   # NULL = 이 그룹 소속 사용자는 전체 탭
+    allowed_tabs = Column(TextList, nullable=True)   # (구) 그룹 탭 기본값 — tab_perms로 대체, 보존용
+    tab_perms    = Column(JSONField, nullable=True)  # 그룹 탭별 권한 기본값 {tab_id: "ALL"|[teams]}. NULL=전체
 
 
 class AppConfig(Base):
