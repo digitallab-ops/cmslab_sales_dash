@@ -2303,6 +2303,7 @@ function renderTable(rows){{
   </thead><tbody>`;
 
   let skuCount=0;
+  const grpSub=[];   // gi → 하위(품목분류/SKU/채널) HTML : 펼칠 때 지연 삽입
   // GRP_ORDER(25년 매출액 내림차순)에 따라 정렬, 목록에 없는 그룹은 뒤에 추가
   const orderedGrps=GRP_ORDER.filter(g=>grpMap.has(g));
   const extraGrps=[...grpMap.keys()].filter(g=>!GRP_ORDER.includes(g)).sort();
@@ -2389,8 +2390,10 @@ function renderTable(rows){{
     if(!hasMatch && q) return;
     // grp-row: 화살표 span만 onclick
     html+=`<tr class="grp-row" data-g="${{gi}}"><td class="fix-col"><span class="toggle-arrow" onclick="toggleGrpRows(${{gi}},this)" title="품목분류 펼치기/접기">▸</span> ${{g}}</td>${{grpCells}}</tr>`;
-    html+=catHtml;
+    grpSub[gi]=catHtml;        // 하위는 펼칠 때 삽입(지연 렌더)
+    if(q) html+=catHtml;       // 검색 중엔 즉시 렌더(기존 동작 유지)
   }});
+  window.__t1Sub=grpSub;
 
   // ═══ 합계 행 (필터/검색이 반영된 rows 전체 총합) ═══
   const grandTot={{}};
@@ -2412,7 +2415,12 @@ function renderTable(rows){{
 
 /* ── 표 토글 ── */
 function toggleGrpRows(gi,arrowEl){{
-  const catRows=[...document.querySelectorAll('.cat-row[data-g="'+gi+'"]')];
+  let catRows=[...document.querySelectorAll('.cat-row[data-g="'+gi+'"]')];
+  // 지연 생성: 하위 행이 아직 없으면 저장해둔 HTML을 품목군 행 뒤에 삽입
+  if(catRows.length===0 && window.__t1Sub && window.__t1Sub[gi]){{
+    const gRow=document.querySelector('#tblOuter tr.grp-row[data-g="'+gi+'"]');
+    if(gRow){{ gRow.insertAdjacentHTML('afterend', window.__t1Sub[gi]); catRows=[...document.querySelectorAll('.cat-row[data-g="'+gi+'"]')]; }}
+  }}
   const hiding=catRows.some(r=>!r.classList.contains('hidden'));
   catRows.forEach(r=>r.classList.toggle('hidden',hiding));
   // 접을 때 하위 SKU/팀 행도 함께 접기 + 화살표 리셋
@@ -2444,6 +2452,15 @@ function toggleSku(gi,ci,si,arrowEl){{
 
 /* 품목별 매출 현황 표 전체 펼치기 (품목분류까지 · SKU/채널은 접힘) */
 function expandAllTbl1(){{
+  // 지연 생성분 먼저 모두 삽입
+  if(window.__t1Sub){{
+    document.querySelectorAll('#tblOuter tr.grp-row').forEach(gRow => {{
+      const gi=gRow.getAttribute('data-g');
+      if(document.querySelectorAll('.cat-row[data-g="'+gi+'"]').length===0 && window.__t1Sub[gi]){{
+        gRow.insertAdjacentHTML('afterend', window.__t1Sub[gi]);
+      }}
+    }});
+  }}
   document.querySelectorAll('#tblOuter .cat-row').forEach(r => r.classList.remove('hidden'));
   document.querySelectorAll('#tblOuter .grp-row .toggle-arrow').forEach(a => a.textContent = '▾');
   // SKU, 채널 행은 hidden 유지 + 화살표 리셋
@@ -2461,6 +2478,13 @@ function collapseAllTbl1(){{
 
 /* 채널별 매출 현황 표 전체 펼치기 (채널 → 거래처 → 품목군 → 품목분류까지) */
 function expandAllTbl2(){{
+  // 지연 생성분 먼저 모두 생성
+  if(window.__t2Built && window.__t2BuildSub){{
+    document.querySelectorAll('#tblOuter2 tr.n2-ch').forEach(chRow => {{
+      const chi = chRow.getAttribute('data-ch');
+      if(!window.__t2Built[chi]){{ chRow.insertAdjacentHTML('afterend', window.__t2BuildSub(chi)); window.__t2Built[chi] = true; }}
+    }});
+  }}
   document.querySelectorAll('#tblOuter2 .n2-cs').forEach(r => r.classList.remove('hidden'));
   document.querySelectorAll('#tblOuter2 .n2-gp').forEach(r => r.classList.remove('hidden'));
   document.querySelectorAll('#tblOuter2 .n2-ct').forEach(r => r.classList.remove('hidden'));
@@ -2548,10 +2572,45 @@ function renderTable2(rows){{
   // 채널명 정렬: 팀참고 파일 순서 우선, 나머지는 한글순
   const chNames = sortByChannelOrder([...chMap.keys()]);
   let skuCount = 0;
+  const chStore = [];   // chi → {{csAggs}} : 하위행 지연(lazy) 생성용 데이터 보관
+
+  // 채널 하위(거래처>품목군>품목분류>SKU) 행 HTML 생성. makeCells 재사용 → 값 100% 동일.
+  // 초기엔 채널행만 그리고, 펼칠 때 이 함수로 하위 행을 생성한다(클릭 렉 방지).
+  function buildSub(chi){{
+    const st = chStore[chi];
+    if(!st) return '';
+    const csAggs = st.csAggs;
+    const csKeys = [...csAggs.keys()];
+    let h = '';
+    csAggs.forEach((csD, cs) => {{
+      const csi = csKeys.indexOf(cs);
+      h += `<tr class="n2-cs hidden" data-ch="${{chi}}" data-cs="${{csi}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('cs',${{chi}},${{csi}},0,0,this)" title="펼치기/접기">▸</span> ${{cs}}</td>${{makeCells(csD.csTot)}}</tr>`;
+      const gpKeys = [...csD.gpAggs.keys()];
+      csD.gpAggs.forEach((gpD, gp) => {{
+        const gpi = gpKeys.indexOf(gp);
+        h += `<tr class="n2-gp hidden" data-ch="${{chi}}" data-cs="${{csi}}" data-gp="${{gpi}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('gp',${{chi}},${{csi}},${{gpi}},0,this)" title="펼치기/접기">▸</span> ${{gp}}</td>${{makeCells(gpD.gpTot)}}</tr>`;
+        const ctKeys = [...gpD.ctAggs.keys()];
+        gpD.ctAggs.forEach((ctD, ct) => {{
+          const cti = ctKeys.indexOf(ct);
+          h += `<tr class="n2-ct hidden" data-ch="${{chi}}" data-cs="${{csi}}" data-gp="${{gpi}}" data-ct="${{cti}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('ct',${{chi}},${{csi}},${{gpi}},${{cti}},this)" title="펼치기/접기">▸</span> ${{ct}}</td>${{makeCells(ctD.ctTot)}}</tr>`;
+          ctD.skus.forEach(sd => {{
+            const stCls = sd.e.sale_type==='판매품'?'sb-sale':sd.e.sale_type==='증정품'?'sb-gift':'sb-none';
+            const stTxt = sd.e.sale_type||'-';
+            h += `<tr class="n2-sk hidden" data-ch="${{chi}}" data-cs="${{csi}}" data-gp="${{gpi}}" data-ct="${{cti}}"><td class="fix-col" title="${{sd.e.sku_name}}"><span class="sale-badge ${{stCls}}">${{stTxt}}</span>${{sd.e.sku}} ${{sd.e.sku_name}}</td>${{makeCells(sd.totForSku)}}</tr>`;
+          }});
+        }});
+      }});
+    }});
+    return h;
+  }}
+  window.__t2BuildSub = buildSub;
+  window.__t2Built = {{}};
+
   chNames.forEach((ch, chi) => {{
     const csMap = chMap.get(ch);
     // 채널 합계 = 하위 전체
     const chTot = newTot();
+    let chSku = 0;
     // 거래처 별로 진행, 하위 합계 계산
     const csNames = [...csMap.keys()].sort((a,b)=>a.localeCompare(b,'ko'));
 
@@ -2581,6 +2640,7 @@ function renderTable2(rows){{
             addTot(ctTot, e.data);
             skus.push({{e, totForSku}});
           }});
+          chSku += skus.length;
           addTot(gpTot, ctTot);
           ctAggs.set(ct, {{ctTot, skus}});
         }});
@@ -2590,6 +2650,7 @@ function renderTable2(rows){{
       addTot(chTot, csTot);
       csAggs.set(cs, {{csTot, gpAggs, gpNames}});
     }});
+    chStore[chi] = {{csAggs}};
 
     // 검색어 필터: 매치 없으면 채널 전체 스킵
     let chHasMatch = false;
@@ -2610,30 +2671,11 @@ function renderTable2(rows){{
       if(!chHasMatch) return;
     }}
 
-    // 채널 행
+    skuCount += chSku;   // 표시되는 채널의 SKU만 카운트(검색 스킵 채널 제외 — 기존 동작 동일)
+    // 채널 행 (하위 거래처/품목군/품목분류/SKU는 펼칠 때 buildSub로 지연 생성)
     html += `<tr class="n2-ch" data-ch="${{chi}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('ch',${{chi}},0,0,0,this)" title="펼치기/접기">▸</span> ${{ch}}</td>${{makeCells(chTot)}}</tr>`;
-
-    csAggs.forEach((csD, cs) => {{
-      const csi = [...csAggs.keys()].indexOf(cs);
-      html += `<tr class="n2-cs hidden" data-ch="${{chi}}" data-cs="${{csi}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('cs',${{chi}},${{csi}},0,0,this)" title="펼치기/접기">▸</span> ${{cs}}</td>${{makeCells(csD.csTot)}}</tr>`;
-
-      csD.gpAggs.forEach((gpD, gp) => {{
-        const gpi = [...csD.gpAggs.keys()].indexOf(gp);
-        html += `<tr class="n2-gp hidden" data-ch="${{chi}}" data-cs="${{csi}}" data-gp="${{gpi}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('gp',${{chi}},${{csi}},${{gpi}},0,this)" title="펼치기/접기">▸</span> ${{gp}}</td>${{makeCells(gpD.gpTot)}}</tr>`;
-
-        gpD.ctAggs.forEach((ctD, ct) => {{
-          const cti = [...gpD.ctAggs.keys()].indexOf(ct);
-          html += `<tr class="n2-ct hidden" data-ch="${{chi}}" data-cs="${{csi}}" data-gp="${{gpi}}" data-ct="${{cti}}"><td class="fix-col"><span class="toggle-arrow" onclick="tog2('ct',${{chi}},${{csi}},${{gpi}},${{cti}},this)" title="펼치기/접기">▸</span> ${{ct}}</td>${{makeCells(ctD.ctTot)}}</tr>`;
-
-          ctD.skus.forEach(sd => {{
-            const stCls = sd.e.sale_type==='판매품'?'sb-sale':sd.e.sale_type==='증정품'?'sb-gift':'sb-none';
-            const stTxt = sd.e.sale_type||'-';
-            skuCount++;
-            html += `<tr class="n2-sk hidden" data-ch="${{chi}}" data-cs="${{csi}}" data-gp="${{gpi}}" data-ct="${{cti}}"><td class="fix-col" title="${{sd.e.sku_name}}"><span class="sale-badge ${{stCls}}">${{stTxt}}</span>${{sd.e.sku}} ${{sd.e.sku_name}}</td>${{makeCells(sd.totForSku)}}</tr>`;
-          }});
-        }});
-      }});
-    }});
+    // 검색 중이면 하위를 즉시 생성(기존 검색 동작 유지)
+    if(q){{ html += buildSub(chi); window.__t2Built[chi] = true; }}
   }});
 
   // ═══ 합계 행 (필터/검색이 반영된 rows 전체 총합) ═══
@@ -2652,6 +2694,11 @@ function renderTable2(rows){{
 
 /* 두 번째 표의 5단계 토글 (level: ch/cs/gp/ct) */
 function tog2(level, chi, csi, gpi, cti, arrowEl){{
+  // 지연 생성: 채널을 처음 펼칠 때 하위 행을 생성해 채널행 뒤에 삽입
+  if(level === 'ch' && window.__t2Built && !window.__t2Built[chi] && window.__t2BuildSub){{
+    const chRow = document.querySelector('#tblOuter2 tr.n2-ch[data-ch="'+chi+'"]');
+    if(chRow){{ chRow.insertAdjacentHTML('afterend', window.__t2BuildSub(chi)); window.__t2Built[chi] = true; }}
+  }}
   let sel = '';
   if(level === 'ch') sel = 'tr.n2-cs[data-ch="'+chi+'"]';
   else if(level === 'cs') sel = 'tr.n2-gp[data-ch="'+chi+'"][data-cs="'+csi+'"]';

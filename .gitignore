@@ -6,4 +6,5 @@ __pycache__/
 venv/
 *.xlsx
 *.xls
-*.db
+*.db_jstest/
+sales_dev.db
