@@ -3,11 +3,15 @@
 새 탭 추가 시 이 목록에만 추가하면 어드민 권한 설정 UI에 자동 반영됨.
 """
 
+# scope_default: 명시적 권한(tab_perms)이 없을 때 그 탭에서 보이는 팀 범위 기본값
+#   "all" = 전체 팀,  "own" = 사용자 본인 소속 팀(group_team)만
 TABS = [
-    {"id": "dashboard", "label": "매출 대시보드", "route": "/dashboard"},
-    {"id": "compare",   "label": "매출현황(표)",  "route": "/compare"},
-    {"id": "items",     "label": "품목별 매출",   "route": "/items"},
+    {"id": "dashboard", "label": "매출 대시보드", "route": "/dashboard", "scope_default": "all"},
+    {"id": "compare",   "label": "매출현황(표)",  "route": "/compare",   "scope_default": "all"},
+    {"id": "items",     "label": "품목별 매출",   "route": "/items",     "scope_default": "own"},
 ]
+
+_SCOPE_DEFAULT = {t["id"]: t.get("scope_default", "all") for t in TABS}
 
 
 def resolve_perms(user, group_team=None):
@@ -30,9 +34,17 @@ def can_access_tab(user, tab_id: str, group_team=None) -> bool:
 
 
 def tab_teams(user, tab_id: str, group_team=None):
-    """해당 탭에서 볼 수 있는 팀 목록. None = 전체 팀(제한 없음)."""
+    """해당 탭에서 볼 수 있는 팀 목록. None = 전체 팀(제한 없음).
+
+    명시적 tab_perms가 없으면 탭 기본값(scope_default) 적용:
+      - "all"  → 전체 팀
+      - "own"  → 사용자 본인 소속 팀(group_team)만. 소속 없으면 전체(관리자가 그룹 지정 필요).
+    """
     perms = resolve_perms(user, group_team)
     if perms is None:
+        if _SCOPE_DEFAULT.get(tab_id, "all") == "own":
+            name = getattr(group_team, "name", None) if group_team is not None else None
+            return [name] if name else None
         return None
     scope = perms.get(tab_id)
     if scope is None or scope == "ALL":

@@ -502,9 +502,14 @@ body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5
                 <span class="badge bg-info bg-opacity-10 text-info border border-info me-1" style="font-size:10px">개인</span>
                 {% for tab in tabs %}{% if tab.id in u.tab_perms %}<div>{{ tab.label }}<span class="text-muted"> · {{ '전체' if u.tab_perms[tab.id] == 'ALL' else (u.tab_perms[tab.id] | join(', ')) }}</span></div>{% endif %}{% endfor %}
               {% elif u.group_team_id %}
-                <span class="badge bg-secondary bg-opacity-10 text-secondary border me-1" style="font-size:10px">그룹 상속</span>
+                {% set gt = all_teams | selectattr('id', 'equalto', u.group_team_id) | first %}
+                {% if gt and gt.tab_perms %}
+                  <span class="badge bg-secondary bg-opacity-10 text-secondary border me-1" style="font-size:10px">그룹 상속</span>{{ gt.name }} 설정 따름
+                {% else %}
+                  <span class="text-muted" style="font-size:11px">기본값 · 전체매출 전 팀 / 그 외 본인팀({{ gt.name if gt else '?' }})</span>
+                {% endif %}
               {% else %}
-                <span class="text-muted">전체 탭 · 전체 팀</span>
+                <span class="text-muted" style="font-size:11px">기본값 · 전체매출 전 팀 / 그 외 전체(그룹 미지정)</span>
               {% endif %}
               {% if u.id != user.id %}
               <button class="btn btn-outline-primary py-0 px-2 ms-1 mt-1" style="font-size:11px"
