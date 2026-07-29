@@ -84,6 +84,44 @@ def _build_sales_context(db: Session, allowed_teams: Optional[list]) -> str:
     return "\n".join(lines)
 
 
+def _build_item_context(db: Session, allowed_teams: Optional[list]) -> str:
+    """품목별 매출(item_records) 요약: 팀별·품목군·상위 SKU (백만원 단위 rev, 수량)."""
+    from ..models import ItemSnapshot, ItemRecord
+
+    snap = db.query(ItemSnapshot).filter(ItemSnapshot.is_active == True).first()
+    if not snap:
+        return "품목별 매출 데이터가 아직 업로드되지 않았습니다."
+
+    base = db.query(ItemRecord).filter(ItemRecord.snapshot_id == snap.id)
+    if allowed_teams:
+        base = base.filter(ItemRecord.team.in_(allowed_teams))
+
+    def _top(col, label, limit):
+        rows = (
+            base.with_entities(col, func.sum(ItemRecord.rev).label("rev"), func.sum(ItemRecord.qty).label("qty"))
+            .group_by(col).order_by(func.sum(ItemRecord.rev).desc()).limit(limit).all()
+        )
+        out = []
+        for r in rows:
+            name = getattr(r, col.key) or "(미분류)"
+            out.append(f"  {name}: 매출 {float(r.rev or 0)/1e6:,.0f}백만 / 수량 {float(r.qty or 0):,.0f}")
+        return out
+
+    scope = ("전체 팀" if not allowed_teams else ", ".join(allowed_teams))
+    lines = [
+        f"=== 품목별 매출 요약 (기준일 {snap.base_date}, 범위: {scope}) ===",
+        "[팀별]",
+    ]
+    lines += _top(ItemRecord.team, "팀", 20)
+    lines += ["[품목군 상위]"]
+    lines += _top(ItemRecord.item_group, "품목군", 12)
+    lines += ["[브랜드]"]
+    lines += _top(ItemRecord.brand, "브랜드", 10)
+    lines += ["[상위 SKU]"]
+    lines += _top(ItemRecord.sku_name, "SKU", 15)
+    return "\n".join(lines)
+
+
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 
 @router.get("/chat/status")
@@ -111,11 +149,14 @@ async def chat(
     from ..models import Team
     group_team = db.query(Team).filter(Team.id == current_user.group_team_id).first() if current_user.group_team_id else None
     sales_ctx = _build_sales_context(db, tab_teams(current_user, "dashboard", group_team))
+    item_ctx = _build_item_context(db, tab_teams(current_user, "items", group_team))
 
     system_prompt = f"""당신은 CMS Lab 매출 대시보드 AI 분석 어시스턴트입니다.
 현재 사용자: {current_user.name or current_user.email} ({'관리자' if current_user.role == 'admin' else '일반 사용자'})
 
 {sales_ctx}
+
+{item_ctx}
 
 답변 규칙:
 - 한국어로 간결하게 답변 (3~5문장 이내 원칙, 복잡한 분석은 예외)
