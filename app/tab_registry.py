@@ -5,13 +5,15 @@
 
 # scope_default: 명시적 권한(tab_perms)이 없을 때 그 탭에서 보이는 팀 범위 기본값
 #   "all" = 전체 팀,  "own" = 사용자 본인 소속 팀(group_team)만
+# 매출 대시보드만 전체 팀, 그 외 모든 탭(신규 포함)은 기본 본인 팀.
 TABS = [
     {"id": "dashboard", "label": "매출 대시보드", "route": "/dashboard", "scope_default": "all"},
-    {"id": "compare",   "label": "매출현황(표)",  "route": "/compare",   "scope_default": "all"},
+    {"id": "compare",   "label": "매출현황(표)",  "route": "/compare",   "scope_default": "own"},
     {"id": "items",     "label": "품목별 매출",   "route": "/items",     "scope_default": "own"},
 ]
 
-_SCOPE_DEFAULT = {t["id"]: t.get("scope_default", "all") for t in TABS}
+# 미지정 탭(신규 등)의 기본은 "own" — 본인 팀만 보이도록 안전하게.
+_SCOPE_DEFAULT = {t["id"]: t.get("scope_default", "own") for t in TABS}
 
 
 def resolve_perms(user, group_team=None):
@@ -42,7 +44,7 @@ def tab_teams(user, tab_id: str, group_team=None):
     """
     perms = resolve_perms(user, group_team)
     if perms is None:
-        if _SCOPE_DEFAULT.get(tab_id, "all") == "own":
+        if _SCOPE_DEFAULT.get(tab_id, "own") == "own":
             name = getattr(group_team, "name", None) if group_team is not None else None
             return [name] if name else None
         return None
